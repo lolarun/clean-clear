@@ -97,6 +97,7 @@ For each video the output directory contains:
 | `--pad-frames` | `1` | extra frames erased before/after each subtitle, for fade in/out |
 | `--ocr-interval` | `10` | max frames to skip OCR while the subtitle band is unchanged. `1` runs OCR on every frame: most accurate, slowest |
 | `--min-dur` | `0.4` | subtitles shorter than this many seconds are treated as noise |
+| `--watermark` | `off` | also erase a static corner logo on every frame: `auto` samples ~150 frames and finds pixels that never change in the four corners; or pass a mask image of the video's size (white = watermark). The detected mask is saved to `.cache/name.watermark.png` for inspection |
 | `--max-gap` | `5` | missed frames tolerated within one subtitle |
 | `--min-score` | `0.6` | OCR confidence threshold |
 | `--min-height` | `0.015` | minimum text height as a fraction of frame height |
@@ -112,7 +113,8 @@ For each video the output directory contains:
    - `propainter`: frames are streamed in chunks; only the frame ranges with subtitles and only the subtitle band are inpainted using neighbouring frames
 
    In both cases only pixels inside the mask are replaced
-6. **Encoding**: ffmpeg encodes the video and copies the original audio
+6. **Watermark** (optional, `--watermark`): a static logo is found by sampling frames across the video, and the same erase step runs on it for every frame (before the subtitle step, chained on the same frame stream, so the video is still decoded and encoded once)
+7. **Encoding**: ffmpeg encodes the video and copies the original audio
 
 ## Performance
 
@@ -156,7 +158,10 @@ run.bat D:\videos -o D:\output -m propainter
 |---|---|---|
 | `--propainter-dir` | `$PROPAINTER_DIR` or `./ProPainter` | ProPainter checkout containing `weights/` |
 | `--pp-chunk` | `120` | frames per chunk. GPU memory grows with it: ~13 GB at 120 frames for a 1080p subtitle band. Use `80` or lower on 8 GB cards |
-| `--pp-raft-iter` | `20` | optical flow iterations; fewer is faster but less accurate |
+| `--pp-raft-iter` | `12` | optical flow iterations; fewer is faster but less accurate |
+| `--pp-ctx` | `10` | context frames added on each side of a chunk for flow estimation; lower it for less redundant work between chunks |
+| `--pp-pad` | `8` | extra frames inpainted before/after each run of subtitle frames |
+| `--pp-margin` | `80` | horizontal margin (px) kept around the subtitle when cropping columns; only this cropped region is processed instead of the full frame width |
 
 The OCR cache is shared between models, so you can switch between `lama` and `propainter` on the same output directory without running OCR again.
 
@@ -168,6 +173,7 @@ cli.py             command-line options, batch loop
 pipeline.py        per-video flow: OCR -> SRT -> masks -> erase -> encode
 subtitles.py       OCR, subtitle-line detection, segmentation, SRT
 masks.py           glyph / box masks
+watermark.py       static watermark detection
 video.py           ffmpeg decoding and encoding
 device.py          ONNX Runtime device selection
 common.py          shared constants and helpers

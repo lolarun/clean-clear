@@ -42,14 +42,16 @@ Q1 + Q2 are expected to remove most visible smearing (static dialogue shots are 
 
 | # | Item | Expected gain | Effort | Priority |
 |---|---|---|---|---|
-| P1 | **Horizontal crop**: process only the columns around the subtitle (mask bbox + margin, rounded to 8) instead of the full 1920 px width | ~2× | 0.25 d | P0 |
-| P2 | **Fewer RAFT iterations** (20 → 10–12); flow is ~30–40% of the time | 20–30% | 0.1 d + quality check | P0 |
-| P3 | **Less redundant work**: smaller context/padding, reuse flow of overlapping context frames | 15–20% | 0.5 d | P1 |
-| P4 | **Pipelining**: decode, GPU inference and encode in separate threads | 10–20% | 0.5 d | P1 |
+| P1 | **Horizontal crop**: process only the columns around the subtitle (mask bbox + margin, rounded to 8) instead of the full 1920 px width | ~2× | 0.25 d | ✅ done, offline-verified with a fake engine |
+| P2 | **Fewer RAFT iterations** (20 → 10–12); flow is ~30–40% of the time | 20–30% | 0.1 d + quality check | ✅ done (default lowered to 12), **not yet verified on GPU** |
+| P3 | **Less redundant work**: smaller context/padding, reuse flow of overlapping context frames | 15–20% | 0.5 d | ⚠️ partial: `CTX`/`PAD` are now CLI-tunable (`--pp-ctx`, `--pp-pad`), defaults unchanged; true flow-reuse across chunks not implemented (needs an `ProPainterEngine` refactor to cache flow between calls) |
+| P4 | **Pipelining**: decode, GPU inference and encode in separate threads | 10–20% | 0.5 d | ✅ done (`video.prefetch` / `video.ThreadedWriter`), offline-verified for order/correctness |
 | P5 | **Half-resolution mode** (optional flag): inpaint the band at 0.5×, upscale only the inpainted pixels | 2–4× | 0.5 d | P2, trades sharpness |
 | P6 | Batch small chunks together; `torch.compile` / TensorRT for the inpainting network | 10–30% | 1 d | P3 |
 
 P1–P4 together should bring ProPainter from ~35–45 min to roughly 10–15 min on an A10 for the test clip. Q2 also saves time: pixels filled from a clean plate need no network inference.
+
+**Status (2026-09-27):** P1, P2 and P4 implemented in `backends/propainter.py` / `video.py` / `pipeline.py`; P3 only partially (tunable knobs, no flow caching). Verified offline with fake engines/generators (chunking, cropping, streaming order all correct); **no GPU run yet** to confirm speed-up or that lowering RAFT iterations to 12 doesn't visibly hurt quality — needs a real A10/3050/5090 run before delivery.
 
 ## Suggested order
 
