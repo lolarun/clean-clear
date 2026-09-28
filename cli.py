@@ -56,12 +56,23 @@ def build_argparser():
     ap.add_argument("--min-score", type=float, default=0.6, help="OCR confidence threshold")
     ap.add_argument("--min-height", type=float, default=0.015, help="minimum text height as a fraction of frame height")
 
+    ap.add_argument("--watermark", default="off", metavar="off|auto|MASK.png",
+                    help="also erase a static corner logo on every frame: auto = detect it, or give a mask image "
+                         "of the video's size (white = watermark) (default: off)")
+
     pp = ap.add_argument_group("ProPainter options")
     pp.add_argument("--propainter-dir", default=os.environ.get("PROPAINTER_DIR", str(ROOT / "ProPainter")),
                     help="ProPainter checkout with weights/ (default: $PROPAINTER_DIR or ./ProPainter)")
     pp.add_argument("--pp-chunk", type=int, default=120,
                     help="frames per ProPainter chunk; lower it if GPU memory runs out (80 for 8 GB cards)")
-    pp.add_argument("--pp-raft-iter", type=int, default=20, help="optical flow iterations, fewer is faster")
+    pp.add_argument("--pp-raft-iter", type=int, default=12,
+                    help="optical flow iterations, fewer is faster (default: 12; was 20)")
+    pp.add_argument("--pp-ctx", type=int, default=10,
+                    help="context frames added on each side of a chunk for flow estimation")
+    pp.add_argument("--pp-pad", type=int, default=8,
+                    help="extra frames inpainted before/after each run of subtitle frames")
+    pp.add_argument("--pp-margin", type=int, default=80,
+                    help="horizontal margin (px) kept around the subtitle when cropping columns to process")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return ap
 
@@ -77,7 +88,8 @@ def main(argv=None):
     backend = encoder = None
     if not args.srt_only:
         backend = backends.create(args.model, providers=prov, propainter_dir=args.propainter_dir,
-                                  chunk=args.pp_chunk, raft_iter=args.pp_raft_iter)
+                                  chunk=args.pp_chunk, raft_iter=args.pp_raft_iter,
+                                  ctx=args.pp_ctx, pad=args.pp_pad, margin=args.pp_margin)
         encoder = pick_encoder(args.encoder)
         log(f"model: {args.model}  encoder: {encoder}")
     out_dir = Path(args.out)

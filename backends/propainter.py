@@ -183,13 +183,15 @@ class ProPainterEngine:
 class ProPainterBackend:
     name = "propainter"
     uses_cuts = True  # the pipeline passes shot cuts to erase()
-    CTX = 10  # context frames added on each side of a chunk
-    PAD = 8   # extra frames inpainted around each run of subtitle frames
+    MIN_SIDE = 128    # smallest band height / crop width (px) handed to the models
 
-    def __init__(self, repo, chunk=120, raft_iter=20):
+    def __init__(self, repo, chunk=120, raft_iter=20, ctx=10, pad=8, margin=80):
         if not repo or not Path(repo).is_dir():
             sys.exit("ProPainter needs --propainter-dir pointing to a ProPainter checkout (see README)")
         self.chunk = chunk
+        self.CTX = ctx    # context frames added on each side of a chunk
+        self.PAD = pad    # extra frames inpainted around each run of subtitle frames
+        self.margin = margin  # horizontal margin (px) kept around the subtitle when cropping columns
         self.engine = ProPainterEngine(repo, raft_iter=raft_iter, subvideo_length=chunk + 2 * self.CTX)
 
     def _chunks(self, frame_seg, cuts=()):
@@ -229,13 +231,23 @@ class ProPainterBackend:
             return
         H, W = next(iter(masks.values())).shape
         rows = np.nonzero(np.any([m.any(1) for m in masks.values()], 0))[0]
-        r0 = int(max(0, (rows.min() - 40) // 8 * 8))
-        r1 = int(min(H, r0 + ((rows.max() + 40 - r0 + 7) // 8) * 8))
-        W8 = (W + 7) // 8 * 8
+        # RAFT's feature extractor needs both crop dimensions to be exact multiples of 8; clamping
+        # r1 to H (frame height) instead of a multiple of 8 breaks that when H itself isn't one
+        # (e.g. 714px), which shows up as a batch-size mismatch deep inside RAFT's correlation lookup.
+        H8 = H // 8 * 8
+        lo = max(0, int(rows.min()) - 40)
+        hi = min(H, int(rows.max()) + 40)
+        height = (hi - lo + 7) // 8 * 8
+        r0 = lo // 8 * 8
+        if r0 + height > H8:
+            r0 = max(0, H8 - height)
+        r1 = min(H8, r0 + height)
+        if r1 - r0 < self.MIN_SIDE:  # tiny regions (e.g. a corner logo) still need some context
+            r1 = min(H8, r0 + self.MIN_SIDE)
+            r0 = max(0, r1 - self.MIN_SIDE) // 8 * 8
         kern = np.ones((9, 9), np.uint8)
         # composite only within the mask dilated by 4 px
         paste = {k: cv2.dilate(m[r0:r1].astype(np.uint8), kern).astype(bool) for k, m in masks.items()}
-        empty = np.zeros((r1 - r0, W8), bool)
 
         pending = deque(self._chunks(frame_seg, cuts))
         n_chunks = len(pending)
@@ -244,32 +256,58 @@ class ProPainterBackend:
             need.update(range(cs, ce + 1))
         log(f"  propainter: band y={r0}-{r1}, {n_chunks} chunks")
         buf = {}    # frames not yet emitted
-        bands = {}  # original bands still needed as chunk input
+        bands = {}  # original bands (full row-band width) still needed as chunk input
         nxt = 0
 
         def band_of(f):
-            b = f[r0:r1]
-            return np.pad(b, ((0, 0), (0, W8 - W), (0, 0)), mode="edge") if W8 != W else b.copy()
+            return f[r0:r1].copy()
+
+        def crop_cols(ids):
+            """Horizontal crop (columns around the subtitle, padded to a multiple of 8): a chunk's
+            subtitle is usually much narrower than the frame, so this keeps the engine's per-frame
+            work proportional to the text width instead of the full video width."""
+            keys = {frame_seg[i] for i in ids if frame_seg.get(i) is not None}
+            if not keys:
+                return 0, W
+            cols = np.zeros(W, bool)
+            for k in keys:
+                cols |= masks[k][r0:r1].any(0)
+            xs = np.nonzero(cols)[0]
+            c0 = int(max(0, (xs.min() - self.margin) // 8 * 8))
+            c1 = int(min(W, c0 + ((xs.max() + self.margin - c0 + 7) // 8) * 8))
+            if c1 - c0 < self.MIN_SIDE:
+                c1 = min(W, c0 + self.MIN_SIDE)
+                c0 = max(0, c1 - self.MIN_SIDE) // 8 * 8
+            return c0, c1
 
         def run(chunk, last):
             s, e, cs, ce = chunk
             ids = [i for i in range(cs, min(ce, last) + 1) if i in bands]
             if not ids:
                 return
+            c0, c1 = crop_cols(ids)
+            w, h = c1 - c0, r1 - r0
+            w8, h8 = (w + 7) // 8 * 8, (h + 7) // 8 * 8  # the models need multiples of 8
+            empty = np.zeros((h8, w8), bool)
+
+            def crop_frame(a):
+                a = a[:, c0:c1]
+                return np.pad(a, ((0, h8 - h), (0, w8 - w), (0, 0)), mode="edge") if (h8, w8) != (h, w) else a.copy()
+
+            def crop_mask(a):
+                a = a[:, c0:c1]
+                return np.pad(a, ((0, h8 - h), (0, w8 - w))) if (h8, w8) != (h, w) else a.copy()
+
             ms = []
             for i in ids:
                 k = frame_seg.get(i)
-                if k is None:
-                    ms.append(empty)
-                else:
-                    m = masks[k][r0:r1]
-                    ms.append(np.pad(m, ((0, 0), (0, W8 - W))) if W8 != W else m)
-            res = self.engine([bands[i] for i in ids], ms)
+                ms.append(empty if k is None else crop_mask(masks[k][r0:r1]))
+            res = self.engine([crop_frame(bands[i]) for i in ids], ms)
             for j, i in enumerate(ids):
                 k = frame_seg.get(i)
                 if s <= i <= e and k is not None and i in buf:
-                    b = buf[i][r0:r1]
-                    b[paste[k]] = res[j][:, :W][paste[k]]
+                    b = buf[i][r0:r1, c0:c1]
+                    b[paste[k][:, c0:c1]] = res[j][:h, :w][paste[k][:, c0:c1]]
             log(f"  [propainter] chunk {n_chunks - len(pending)}/{n_chunks}")
 
         last = -1

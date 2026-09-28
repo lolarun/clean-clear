@@ -1,14 +1,16 @@
-"""Per-video pipeline: OCR -> SRT -> masks -> erase (LaMa or ProPainter) -> encode."""
+"""Per-video pipeline: OCR -> SRT -> masks -> [watermark] -> erase (LaMa or ProPainter) -> encode."""
 import json
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from common import log
 from masks import box_masks, frame_masks, glyph_masks, white_pixels
 from subtitles import frame_boxes, segments_from_ocr, write_srt
-from video import detect_cuts, open_writer, probe, read_frames
+import watermark
+from video import ThreadedWriter, detect_cuts, open_writer, prefetch, probe, read_frames
 
 
 def parse_band(s, H):
@@ -45,6 +47,32 @@ def run_ocr(src, W, H, n, band, ocr, args):
             log(f"  [ocr] {i}/{n}  {i / max(el, 1e-6):.1f} fps  {txt}")
     log(f"  OCR ran on {n_ocr}/{len(per_frame)} frames")
     return per_frame
+
+
+def watermark_mask(src, out_dir, W, H, fps, n, args):
+    """--watermark off | auto | <mask image>: HxW bool mask of a static overlay to remove on every frame, or None"""
+    if args.watermark == "off":
+        return None
+    if args.watermark != "auto":
+        img = cv2.imread(args.watermark, cv2.IMREAD_GRAYSCALE)
+        if img is None or img.shape != (H, W):
+            raise ValueError(f"--watermark mask must be a {W}x{H} image (white = watermark): {args.watermark}")
+        return img > 127
+    cache = out_dir / ".cache" / f"{src.stem}.watermark.png"  # cached like OCR; an all-black image means none found
+    if cache.exists() and not args.no_cache:
+        m = cv2.imread(str(cache), cv2.IMREAD_GRAYSCALE) > 127
+        log(f"  using watermark cache {cache}")
+    else:
+        t0 = time.time()
+        found = watermark.detect(src, W, H, n / fps)
+        m = found if found is not None else np.zeros((H, W), bool)
+        cache.parent.mkdir(exist_ok=True)
+        cv2.imwrite(str(cache), m.astype(np.uint8) * 255)
+        log(f"  watermark detection ({time.time() - t0:.0f}s), mask saved to {cache}")
+    if not m.any():
+        log("  no watermark found")
+        return None
+    return m
 
 
 def process(src, out_dir, args, ocr, backend, encoder):
@@ -88,20 +116,27 @@ def process(src, out_dir, args, ocr, backend, encoder):
         cuts = detect_cuts(src)
         log(f"  {len(cuts)} shot cuts ({time.time() - t0:.0f}s)")
 
+    wm = watermark_mask(src, out_dir, W, H, fps, n, args)
+
     # Pass 2: erase + encode
     t0 = time.time()
     dst = out_dir / (src.stem + "_clean.mp4")
     wr = open_writer(src, dst, W, H, fps, encoder, args.crf)
+    tw = ThreadedWriter(wr)  # encoding overlaps with the next frame's inference
     written = 0
     try:
-        for frame in backend.erase(read_frames(src, W, H), frame_seg, masks, cuts):
-            wr.stdin.write(np.ascontiguousarray(frame).tobytes())
+        # decoding (ffmpeg) overlaps with inference in the main thread instead of alternating with it
+        stream = prefetch(read_frames(src, W, H))
+        if wm is not None:  # watermark: the same erase() on every frame; chained lazily, so still one decode + one encode
+            log("  erasing watermark on every frame")
+            stream = backend.erase(stream, {i: 0 for i in range(n + 50)}, {0: wm}, cuts)
+        for frame in backend.erase(stream, frame_seg, masks, cuts):
+            tw.write(np.ascontiguousarray(frame).tobytes())
             written += 1
             if written % 100 == 0:
                 log(f"  [erase] {written}/{n}  {written / max(time.time() - t0, 1e-6):.1f} fps")
     finally:
-        wr.stdin.close()
-        wr.wait()
+        tw.close()
     if wr.returncode != 0:
         raise RuntimeError(f"ffmpeg encoding failed (code {wr.returncode})")
     log(f"  video -> {dst}  ({time.time() - t0:.0f}s, {backend.name})")

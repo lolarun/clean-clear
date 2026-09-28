@@ -1,9 +1,11 @@
 """ffmpeg helpers: probing, frame decoding and encoding."""
 import json
 import os
+import queue
 import shutil
 import subprocess
 import sys
+import threading
 
 import numpy as np
 
@@ -93,6 +95,65 @@ def detect_cuts(path, threshold=12.0, ratio=3.0, window=5):
         if len(around) == 0 or d[j] > ratio * max(float(np.median(around)), 2.0):
             cuts.append(int(j) + 1)
     return cuts
+
+
+def prefetch(gen, maxsize=8):
+    """Run `gen` (e.g. read_frames) on a background thread so decoding overlaps with the consumer
+    (GPU inference in the main thread) instead of alternating with it."""
+    q = queue.Queue(maxsize)
+    done = object()
+
+    def worker():
+        try:
+            for item in gen:
+                q.put(item)
+            q.put(done)
+        except Exception as e:
+            q.put(e)
+
+    threading.Thread(target=worker, daemon=True).start()
+    while True:
+        item = q.get()
+        if item is done:
+            return
+        if isinstance(item, Exception):
+            raise item
+        yield item
+
+
+class ThreadedWriter:
+    """Wraps an encoder process (from open_writer) so stdin writes happen on a background thread,
+    overlapping the encoder with the next frame's inference instead of blocking on it."""
+
+    def __init__(self, proc, maxsize=8):
+        self.proc = proc
+        self._q = queue.Queue(maxsize)
+        self._err = None
+        self._t = threading.Thread(target=self._worker, daemon=True)
+        self._t.start()
+
+    def _worker(self):
+        try:
+            while True:
+                buf = self._q.get()
+                if buf is None:
+                    return
+                self.proc.stdin.write(buf)
+        except Exception as e:
+            self._err = e
+
+    def write(self, buf):
+        if self._err:
+            raise self._err
+        self._q.put(buf)
+
+    def close(self):
+        self._q.put(None)
+        self._t.join()
+        self.proc.stdin.close()
+        self.proc.wait()
+        if self._err:
+            raise self._err
 
 
 def pick_encoder(want):
