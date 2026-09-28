@@ -5,7 +5,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from common import ROOT, log
+from ..common import ROOT, log
 
 LAMA_NAME = "lama_fp32.onnx"
 LAMA_URLS = [
@@ -15,7 +15,7 @@ LAMA_URLS = [
 
 
 def lama_path():
-    for p in [ROOT / "models" / LAMA_NAME, Path.home() / ".cache" / "cleanframe" / LAMA_NAME]:
+    for p in [ROOT / "models" / LAMA_NAME, Path.home() / ".cache" / "clean-clear" / LAMA_NAME]:
         if p.exists():
             return p
     dst = ROOT / "models" / LAMA_NAME

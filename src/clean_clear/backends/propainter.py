@@ -16,7 +16,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from common import log
+from ..common import log
 
 
 def _ref_index(mid, neighbor_ids, length, ref_stride=10, ref_num=-1):
@@ -42,6 +42,8 @@ class ProPainterEngine:
 
     def __init__(self, repo, fp16=True, raft_iter=20, neighbor_length=10, ref_stride=10, subvideo_length=80):
         import torch
+        from ..common import usable_cpus
+        torch.set_num_threads(min(8, usable_cpus()))
         repo = Path(repo).resolve()
         weights = repo / "weights"
         for f in ("ProPainter.pth", "recurrent_flow_completion.pth", "raft-things.pth"):
@@ -308,7 +310,6 @@ class ProPainterBackend:
                 if s <= i <= e and k is not None and i in buf:
                     b = buf[i][r0:r1, c0:c1]
                     b[paste[k][:, c0:c1]] = res[j][:h, :w][paste[k][:, c0:c1]]
-            log(f"  [propainter] chunk {n_chunks - len(pending)}/{n_chunks}")
 
         last = -1
         for last, f in enumerate(frames):

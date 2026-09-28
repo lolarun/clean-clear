@@ -1,6 +1,0 @@
-# Extra dependencies for --model propainter (install after requirements.txt).
-# Install the PyTorch build matching your CUDA version first, see https://pytorch.org/get-started/locally/
-torch>=2.0
-torchvision
-# plus the ProPainter repository's own requirements:
-#   pip install -r ProPainter/requirements.txt

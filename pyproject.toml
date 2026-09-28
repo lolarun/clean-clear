@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clean-clear"
+dynamic = ["version"]
+description = "Remove hardcoded subtitles and static watermarks from videos and extract the subtitles as SRT"
+requires-python = ">=3.10"
+dependencies = [
+    "onnxruntime-gpu[cuda,cudnn]>=1.22",
+    "rapidocr>=3.4",
+    "opencv-python-headless>=4.8",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# PyTorch itself must match your CUDA version: install it first, see https://pytorch.org/get-started/locally/
+propainter = ["torch>=2.0", "torchvision", "einops", "scipy", "scikit-image", "timm", "addict", "pyyaml", "tqdm", "requests"]
+
+[project.scripts]
+clean-clear = "clean_clear.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = { attr = "clean_clear.common.__version__" }

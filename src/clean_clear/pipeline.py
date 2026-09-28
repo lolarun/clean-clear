@@ -6,11 +6,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from common import log
-from masks import box_masks, frame_masks, glyph_masks, white_pixels
-from subtitles import frame_boxes, segments_from_ocr, write_srt
-import watermark
-from video import ThreadedWriter, detect_cuts, open_writer, prefetch, probe, read_frames
+from .common import Progress, log
+from .masks import box_masks, frame_masks, glyph_masks, white_pixels
+from .subtitles import frame_boxes, segments_from_ocr, write_srt
+from . import watermark
+from .video import ThreadedWriter, detect_cuts, open_writer, prefetch, probe, read_frames
 
 
 def parse_band(s, H):
@@ -29,23 +29,24 @@ def run_ocr(src, W, H, n, band, ocr, args):
     t0 = time.time()
     per_frame = []
     min_h = max(8, int(H * args.min_height))
-    ref, last, n_ocr = None, -1, 0
+    ref, last, n_ocr, txt = None, -1, 0, ""
+    prog = Progress("ocr", n)
     for i, strip in enumerate(read_frames(src, W, H, band)):
         sig = white_pixels(strip[::2, ::2])
         if ref is not None and i - last < args.ocr_interval:
             diff = np.count_nonzero(sig ^ ref)
             if diff <= max(30, 0.08 * np.count_nonzero(ref)):
                 per_frame.append(per_frame[-1])
+                prog.update(i + 1, txt)
                 continue
         boxes = frame_boxes(ocr(strip), band[0], W, min_h, args.min_score)
         per_frame.append(boxes)
         ref, last = sig, i
         n_ocr += 1
-        if n_ocr % 100 == 0:
-            el = time.time() - t0
+        if boxes:
             txt = " / ".join(b[4] for b in boxes)
-            log(f"  [ocr] {i}/{n}  {i / max(el, 1e-6):.1f} fps  {txt}")
-    log(f"  OCR ran on {n_ocr}/{len(per_frame)} frames")
+        prog.update(i + 1, txt)
+    log(f"  OCR ran on {n_ocr}/{len(per_frame)} frames ({time.time() - t0:.0f}s)")
     return per_frame
 
 
@@ -104,7 +105,7 @@ def process(src, out_dir, args, ocr, backend, encoder):
     # One fixed mask per subtitle keeps the result temporally stable
     t0 = time.time()
     if args.mask == "glyph":
-        masks = glyph_masks(src, W, H, band, segs, args.dilate, args.grow, args.shadow)
+        masks = glyph_masks(src, W, H, band, segs, args.dilate, args.grow, args.shadow, total=n)
     else:
         masks = box_masks(segs, H, W, args.dilate)
     frame_seg, masks = frame_masks(segs, masks, args.pad_frames)
@@ -113,7 +114,7 @@ def process(src, out_dir, args, ocr, backend, encoder):
     cuts = []
     if getattr(backend, "uses_cuts", False):
         t0 = time.time()
-        cuts = detect_cuts(src)
+        cuts = detect_cuts(src, total=n)
         log(f"  {len(cuts)} shot cuts ({time.time() - t0:.0f}s)")
 
     wm = watermark_mask(src, out_dir, W, H, fps, n, args)
@@ -124,6 +125,10 @@ def process(src, out_dir, args, ocr, backend, encoder):
     wr = open_writer(src, dst, W, H, fps, encoder, args.crf)
     tw = ThreadedWriter(wr)  # encoding overlaps with the next frame's inference
     written = 0
+    # relative cost per frame for the ETA (A10 measurements, ms): pass-through ~7, watermark ~39, subtitle frame ~147
+    cost = np.full(n + 1, 7.0 + (39.0 if wm is not None else 0.0))
+    cost[[i for i in frame_seg if i <= n]] += 147.0
+    prog = Progress("erase", n, cum=np.concatenate([[0.0], np.cumsum(cost)]))
     try:
         # decoding (ffmpeg) overlaps with inference in the main thread instead of alternating with it
         stream = prefetch(read_frames(src, W, H))
@@ -133,8 +138,7 @@ def process(src, out_dir, args, ocr, backend, encoder):
         for frame in backend.erase(stream, frame_seg, masks, cuts):
             tw.write(np.ascontiguousarray(frame).tobytes())
             written += 1
-            if written % 100 == 0:
-                log(f"  [erase] {written}/{n}  {written / max(time.time() - t0, 1e-6):.1f} fps")
+            prog.update(written)
     finally:
         tw.close()
     if wr.returncode != 0:

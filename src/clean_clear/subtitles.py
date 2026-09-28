@@ -5,17 +5,50 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .common import usable_cpus
+
+
+class _FixedShape:
+    """Wraps the recognition session and always feeds it one shape (batch x 3 x 48 x width).
+
+    On some GPUs (seen on an RTX 5090 with onnxruntime-gpu 1.23) every change of input shape costs
+    2-3 s, while repeated calls with the same shape take ~8 ms. Recognition batches vary in width, so
+    padding them (zeros, exactly like RapidOCR pads within a batch) to a fixed shape removes that cost.
+    Batches that do not fit are passed through unchanged."""
+
+    def __init__(self, inner, batch=6, width=1280):
+        self.inner, self.batch, self.width = inner, batch, width
+
+    def __call__(self, x):
+        n, c, h, w = x.shape
+        if n > self.batch or w > self.width:
+            return self.inner(x)
+        pad = np.zeros((self.batch, c, h, self.width), x.dtype)
+        pad[:n, :, :, :w] = x
+        out = self.inner(pad)  # (batch, time steps, classes); time steps grow with the width
+        return out[:n, :-(-out.shape[1] * w // self.width)]
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
 
 class OCR:
-    def __init__(self, device):
+    def __init__(self, device, fixed_shape=False):
         from rapidocr import RapidOCR
+        threads = min(4, usable_cpus())  # the default (all cores) is throttled hard under a container CPU quota
         params = {"Det.limit_type": "max", "Det.limit_side_len": 960,
-                  "Global.log_level": "error"}
+                  "Global.log_level": "error",
+                  "EngineConfig.onnxruntime.intra_op_num_threads": threads,
+                  "EngineConfig.onnxruntime.inter_op_num_threads": 1}
         if device == "cuda":
             params["EngineConfig.onnxruntime.use_cuda"] = True
+            params["EngineConfig.onnxruntime.cuda_ep_cfg.cudnn_conv_algo_search"] = "HEURISTIC"
         elif device == "dml":
             params["EngineConfig.onnxruntime.use_dml"] = True
         self.engine = RapidOCR(params=params)
+        if fixed_shape:
+            rec = self.engine.text_rec
+            rec.session = _FixedShape(rec.session, batch=rec.rec_batch_num)
 
     def __call__(self, img):
         r = self.engine(img, use_cls=False)

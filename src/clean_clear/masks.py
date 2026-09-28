@@ -2,8 +2,8 @@
 import cv2
 import numpy as np
 
-from common import log
-from video import read_frames
+from .common import Progress, log
+from .video import read_frames
 
 
 def white_pixels(img):
@@ -25,7 +25,7 @@ def box_masks(segs, H, W, dilate):
     return {k: box_mask(s, H, W, dilate) for k, s in enumerate(segs)}
 
 
-def glyph_masks(src, W, H, band, segs, dilate, grow, shift):
+def glyph_masks(src, W, H, band, segs, dilate, grow, shift, total=0):
     """Glyph masks: within a segment, pixels that are white in more than half of the frames are text;
     they are then dilated to cover the outline and shadow. Inpainting only the strokes instead of the
     whole text box keeps far more original pixels, so the result is sharper, and the mask is fixed
@@ -40,7 +40,9 @@ def glyph_masks(src, W, H, band, segs, dilate, grow, shift):
         rects.append((ys.min(), ys.max() + 1, xs.min(), xs.max() + 1))
     seg_of = {i: k for k, s in enumerate(segs) for i in range(s.start, s.end + 1)}
     counts = {}
+    prog = Progress("masks", total or len(seg_of))
     for i, strip in enumerate(read_frames(src, W, H, band)):
+        prog.update(i + 1)
         k = seg_of.get(i)
         if k is not None:
             ry0, ry1, rx0, rx1 = rects[k]

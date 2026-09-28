@@ -1,22 +1,34 @@
 """Command-line entry point: batch-process files and directories."""
+import warnings
+
+warnings.filterwarnings("ignore")  # PyTorch / RAFT deprecation noise would bury the progress lines
+
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
-import backends
-from common import ROOT, __version__, log
-from device import onnx_providers
-from pipeline import process
-from subtitles import OCR
-from video import VIDEO_EXTS, pick_encoder
+from . import backends
+from .common import ROOT, __version__, fmt_time, log, set_log_file, usable_cpus
+
+# BLAS / OpenMP pools default to every core of the host; under a container CPU quota that is very slow
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, str(min(8, usable_cpus())))
+from .device import gpu_compute_capability, onnx_providers
+from .pipeline import process
+from .subtitles import OCR
+from .video import VIDEO_EXTS, pick_encoder
 
 
 def collect_inputs(inputs):
+    """Video files of the given files/directories. Our own `*_clean.*` outputs are skipped, so the
+    output can safely go to the input folder and reruns do not process results again."""
     files = []
     for p in map(Path, inputs):
         if p.is_dir():
-            files += sorted(f for f in p.iterdir() if f.suffix.lower() in VIDEO_EXTS)
+            files += sorted(f for f in p.iterdir()
+                            if f.suffix.lower() in VIDEO_EXTS and not f.stem.endswith("_clean"))
         elif p.exists():
             files.append(p)
         else:
@@ -25,12 +37,13 @@ def collect_inputs(inputs):
 
 
 def build_argparser():
-    ap = argparse.ArgumentParser(prog="cleanframe",
-                                 description="Clean Frame: remove hardcoded subtitles and extract them as SRT")
-    ap.add_argument("inputs", nargs="+", help="video files or directories")
-    ap.add_argument("-o", "--out", default="output", help="output directory (default: ./output)")
-    ap.add_argument("-m", "--model", default="lama", choices=backends.MODELS,
-                    help="inpainting model: lama (fast, default) or propainter (video model, slower)")
+    ap = argparse.ArgumentParser(prog="clean-clear",
+                                 description="Clean Clear: remove hardcoded subtitles and extract them as SRT")
+    ap.add_argument("inputs", nargs="*", default=["."],
+                    help="video files or directories (default: the current directory)")
+    ap.add_argument("-o", "--out", default=".", help="output directory (default: the current directory)")
+    ap.add_argument("-m", "--model", default="propainter", choices=backends.MODELS,
+                    help="inpainting model: propainter (video model, default) or lama (much faster, lower quality)")
     ap.add_argument("--band", default="0.70,1.0",
                     help="horizontal band containing subtitles, as fractions or pixels, e.g. 0.7,1.0 or 800,1080 "
                          "(default: bottom 30%%)")
@@ -40,6 +53,9 @@ def build_argparser():
     ap.add_argument("--no-cache", action="store_true", help="ignore the OCR cache and run OCR again")
     ap.add_argument("--ocr-interval", type=int, default=10,
                     help="max frames to skip OCR while the subtitle band is unchanged (1 = OCR every frame)")
+    ap.add_argument("--ocr-fixed-shape", default="auto", choices=["auto", "on", "off"],
+                    help="feed OCR recognition one fixed input shape. Works around multi-second stalls per new input shape "
+                         "observed on an RTX 5090 with onnxruntime-gpu 1.23. auto = on for compute capability 12+ (default)")
     ap.add_argument("--encoder", default="auto", help="auto / h264_nvenc / libx264 / hevc_nvenc ...")
     ap.add_argument("--crf", type=int, default=18, help="quality, lower is better (default: 18)")
     ap.add_argument("--mask", default="glyph", choices=["glyph", "box"],
@@ -56,9 +72,9 @@ def build_argparser():
     ap.add_argument("--min-score", type=float, default=0.6, help="OCR confidence threshold")
     ap.add_argument("--min-height", type=float, default=0.015, help="minimum text height as a fraction of frame height")
 
-    ap.add_argument("--watermark", default="off", metavar="off|auto|MASK.png",
-                    help="also erase a static corner logo on every frame: auto = detect it, or give a mask image "
-                         "of the video's size (white = watermark) (default: off)")
+    ap.add_argument("--watermark", default="auto", metavar="auto|off|MASK.png",
+                    help="erase a static corner logo on every frame: auto = detect it (default), off = leave it, "
+                         "or a mask image of the video's size (white = watermark)")
 
     pp = ap.add_argument_group("ProPainter options")
     pp.add_argument("--propainter-dir", default=os.environ.get("PROPAINTER_DIR", str(ROOT / "ProPainter")),
@@ -78,13 +94,25 @@ def build_argparser():
 
 
 def main(argv=None):
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")  # never crash on a console code page when printing subtitles
     args = build_argparser().parse_args(argv)
+    import cv2
+    cv2.setNumThreads(min(8, usable_cpus()))
     files = collect_inputs(args.inputs)
     if not files:
         sys.exit("No video files found")
+    out_dir = Path(args.out)
+    set_log_file(out_dir / "clean-clear.log")
+    log(f"Clean Clear {__version__}: {len(files)} video(s) -> {out_dir.resolve()}")
     device, prov = onnx_providers(args.device)
     log(f"device: {device}  providers={prov}")
-    ocr = OCR(device)
+    fixed = args.ocr_fixed_shape == "on" or (
+        args.ocr_fixed_shape == "auto" and device == "cuda" and gpu_compute_capability() >= 12.0)
+    if fixed:
+        log("OCR: fixed recognition input shape")
+    ocr = OCR(device, fixed_shape=fixed)
     backend = encoder = None
     if not args.srt_only:
         backend = backends.create(args.model, providers=prov, propainter_dir=args.propainter_dir,

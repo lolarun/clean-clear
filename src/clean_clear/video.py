@@ -9,7 +9,7 @@ import threading
 
 import numpy as np
 
-from common import ROOT
+from .common import ROOT, Progress
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".flv", ".ts", ".m4v", ".wmv", ".webm"}
 
@@ -63,7 +63,7 @@ def read_frames(path, w, h, crop=None):
         p.wait()
 
 
-def detect_cuts(path, threshold=12.0, ratio=3.0, window=5):
+def detect_cuts(path, threshold=12.0, ratio=3.0, window=5, total=0):
     """Shot cut detection: frame indices that start a new shot.
 
     Consecutive frames are compared as 320x180 grayscale (mean absolute difference, 0-255 scale).
@@ -76,6 +76,7 @@ def detect_cuts(path, threshold=12.0, ratio=3.0, window=5):
            "-f", "rawvideo", "-pix_fmt", "gray", "-"]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=w * h * 16)
     diffs, prev = [], None
+    prog = Progress("cuts", total) if total else None
     try:
         while True:
             buf = p.stdout.read(w * h)
@@ -84,6 +85,8 @@ def detect_cuts(path, threshold=12.0, ratio=3.0, window=5):
             cur = np.frombuffer(buf, np.uint8).astype(np.int16)
             if prev is not None:
                 diffs.append(float(np.abs(cur - prev).mean()))  # diffs[j]: frame j -> j + 1
+                if prog:
+                    prog.update(len(diffs) + 1)
             prev = cur
     finally:
         p.stdout.close()

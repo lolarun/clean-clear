@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 .venv/
+*.egg-info/
+build/
+dist/
 
 # Models and third-party binaries (see README for download links)
 models/

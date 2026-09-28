@@ -5,8 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 
-from common import log
-from video import _exe
+from .common import log
+from .video import _exe
 
 
 def _grab(src, t, W, H):
