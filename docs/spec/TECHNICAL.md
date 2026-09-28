@@ -1,10 +1,10 @@
-# Clean Frame — Technical Design
+# Clean Clear — Technical Design
 
-Version 0.2.x. Companion document: [FUNCTIONAL.md](FUNCTIONAL.md). Defect analyses: [MEMO.md](../../MEMO.md). Roadmap: [PLANNING.md](../../PLANNING.md).
+Version 0.3.x. Companion document: [FUNCTIONAL.md](FUNCTIONAL.md). Defect analyses: [MEMO.md](../../MEMO.md). Roadmap: [PLANNING.md](../../PLANNING.md).
 
 ## 1. Overview
 
-Clean Frame is a single-process Python CLI. For each video it runs a fixed sequence of stages:
+Clean Clear is a single-process Python CLI. For each video it runs a fixed sequence of stages:
 
 ```
                  ┌───────────────────────── pass 1 ─────────────────────────┐
@@ -27,24 +27,25 @@ Design principles:
 ## 2. Repository layout
 
 ```
-main.py             entry point: sys.exit(cli.main())
-cli.py              argument parsing, input discovery, model/encoder setup, per-file loop with error isolation
-pipeline.py         per-video orchestration (both passes), OCR loop, watermark mask resolution
-subtitles.py        OCR wrapper, subtitle-line detection, segmentation, SRT writer
-masks.py            glyph / box masks, per-frame mask assignment
-watermark.py        static watermark detection
-video.py            ffmpeg wrappers: probe, decode, cut detection, encoder selection, threaded I/O helpers
-device.py           ONNX Runtime provider selection
-common.py           ROOT, version, log()
-backends/
-  __init__.py       backend interface and factory
-  lama.py           LaMa (ONNX Runtime)
-  propainter.py     ProPainter (PyTorch)
-docs/spec/          this document and FUNCTIONAL.md
-install.*, run.*    environment setup and launcher scripts
+src/clean_clear/                    the package (src layout, installed with `pip install -e .`)
+  __main__.py                       `python -m clean_clear`
+  cli.py                            argument parsing, input discovery, model/encoder setup, per-file loop with error isolation
+  pipeline.py                       per-video orchestration (both passes), OCR loop, watermark mask resolution
+  subtitles.py                      OCR wrapper, subtitle-line detection, segmentation, SRT writer
+  masks.py                          glyph / box masks, per-frame mask assignment
+  watermark.py                      static watermark detection
+  video.py                          ffmpeg wrappers: probe, decode, cut detection, encoder selection, threaded I/O helpers
+  device.py                         ONNX Runtime provider selection, GPU compute capability
+  common.py                         ROOT, version, log(), Progress, usable_cpus()
+  backends/__init__.py              backend interface and factory
+  backends/lama.py                  LaMa (ONNX Runtime)
+  backends/propainter.py            ProPainter (PyTorch)
+scripts/install.sh, install.bat     environment setup
+docs/spec/                          this document and FUNCTIONAL.md
+pyproject.toml                      dependencies (extra `propainter`), version, the `clean-clear` console script
 ```
 
-`ROOT` (repository root) is where `models/`, an optional `ffmpeg/` folder and the default `ProPainter/` checkout are looked up.
+`ROOT` (repository root, three levels above `common.py` in a source checkout or editable install) is where `models/`, an optional `ffmpeg/` folder and the default `ProPainter/` checkout are looked up. A non-editable install would not find them, which is why the install scripts use `pip install -e .`.
 
 ## 3. Runtime dependencies
 
@@ -194,6 +195,25 @@ Cost drivers and levers:
 
 Implemented optimizations: horizontal crop (P1), fewer RAFT iterations (P2, 20 → 12, **quality not yet validated on a large sample**), tunable context and padding (P3, partial — flow is **not** reused across chunk overlaps), decode/inference/encode threading (P4). Remaining ideas are in PLANNING.md (clean plate for static shots, shot-wide reference frames, half-resolution mode, `torch.compile`).
 
+### 7.1 Measurement on an RTX 5090 container (2026-09-28)
+
+Full run of the 87.6-minute 1280×714 film with all defaults (ProPainter, watermark `auto`, subtitles extracted and erased, libx264 because the container has no NVENC access, 16-core CPU quota):
+
+| Stage | Time |
+|---|---|
+| OCR (47,872 of 131,345 frames recognized) | 3452 s |
+| Glyph masks / shot cuts / watermark detection | 198 s / 84 s / 12 s |
+| Erase subtitles + erase watermark + encode | 7398 s |
+| **Total** | **11,152 s (3 h 06 min), about 2.1 h per hour of video** |
+
+The estimate made before the run (about 1.7 h) was scaled from A10 timings with GPU spec ratios and was too optimistic. During the erase stage the GPU was busy only about 55% of the time and the Python main process ran at about 1.1 cores while the container used about 2.3 of its 16 cores: the stage is bound by single-threaded Python work between GPU calls (cropping, padding, copying results back, compositing, whole-frame copies), which a faster GPU does not speed up. OCR was slower than on the A10 (3452 s vs 1683 s).
+
+### 7.2 Container quirks found on that machine and their workarounds
+
+- **CPU quota.** `os.cpu_count()` reported 128 but the cgroup quota was 16 cores (`/sys/fs/cgroup/cpu.max`). Thread pools sized from the host (onnxruntime, OpenBLAS/OpenMP, PyTorch, OpenCV) were throttled hard; OCR on CPU took 1.28 s per call with default threads and 0.15 s with 4. `common.usable_cpus()` (affinity capped by the quota) now sizes them: at most 4 onnxruntime threads for OCR, at most 8 for OpenMP/BLAS, PyTorch and OpenCV.
+- **Shape changes in onnxruntime-gpu 1.23.2 on Blackwell.** The recognition model ran at 2–8 ms per call for a constant input shape, but each change of shape cost 2–3 s and alternating between many shapes kept every call slow (OCR 205 s for a 40 s clip). `subtitles._FixedShape` pads every recognition batch to `(6, 3, 48, 1280)` (zero padding, the same way RapidOCR pads within a batch), which brought the same clip to 35 s. It is enabled automatically for compute capability 12+ (`--ocr-fixed-shape`), and `cudnn_conv_algo_search=HEURISTIC` is set for the CUDA provider. Two English credit lines differed by one character or space from the variable-shape output. Similar symptoms are reported for RTX 5090 by others ([onnxruntime issue 28305](https://github.com/microsoft/onnxruntime/issues/28305)); the cause was not identified and the container's GPU virtualization may contribute, so this is a workaround, not a documented fix.
+- **No NVENC.** `NVIDIA_DRIVER_CAPABILITIES=compute,utility`: the encoder libraries exist but opening a session fails (`unsupported device`); `pick_encoder("auto")` falls back to libx264.
+
 ## 8. Error handling
 
 | Situation | Behaviour |
@@ -238,7 +258,7 @@ Suggested regression checks: the fixed timestamps listed in PLANNING.md §Valida
 - **Very short shots** (≥ 1 frame) get the duplicate-frame fallback and little context.
 - **Detection heuristics** (subtitle line, white-glyph masks, watermark) are tuned on Chinese dialogue films with white subtitles and one opaque logo; other styles need parameter changes or manual masks.
 - **CPU-bound stages** (decode, OCR pre-processing, cut detection, mask counting) do not speed up with a faster GPU; a weak CPU on the customer's machine will limit throughput.
-- `ROOT` was resolved one directory too high after the files were moved to the repository root; fixed by using the directory of `common.py`. Servers must have `models/` (and `ProPainter/` or `--propainter-dir`) next to `main.py`.
+- `ROOT` is derived from the location of `common.py` (repository root = `parents[2]`); it broke once when files were moved, so keep it in sync with the layout. Servers must have `models/` (and `ProPainter/` or `--propainter-dir`) in the repository root.
 
 ## 11. Extension points
 
@@ -246,4 +266,4 @@ Suggested regression checks: the fixed timestamps listed in PLANNING.md §Valida
 - **Second watermark or moving logo:** call `erase` again in `pipeline.process` with another mask (per-frame masks are already supported by `frame_seg`).
 - **Different OCR engine:** replace `subtitles.OCR`; the rest only needs `[(box, text, score)]` per frame.
 - **Per-video parameters:** `pipeline.process(src, out_dir, args, ...)` reads everything from `args`, so a config-file layer can be added in `cli.py`.
-- **Parallel processing:** run several `main.py` instances on disjoint folders, or several per GPU for small-crop workloads; there is no shared state except the output directory.
+- **Parallel processing:** run several `clean-clear` processes on disjoint folders, or several per GPU for small-crop workloads; there is no shared state except the output directory.

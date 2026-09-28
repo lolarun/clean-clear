@@ -1,10 +1,10 @@
-# Clean Frame — Functional Design
+# Clean Clear — Functional Design
 
-Version 0.2.x. Companion document: [TECHNICAL.md](TECHNICAL.md).
+Version 0.3.x. Companion document: [TECHNICAL.md](TECHNICAL.md).
 
 ## 1. Purpose
 
-Clean Frame is a command-line tool that takes a folder of videos with **hardcoded (burned-in) subtitles** and produces, for every video:
+Clean Clear is a command-line tool that takes a folder of videos with **hardcoded (burned-in) subtitles** and produces, for every video:
 
 1. a **subtitle-free video** in which the subtitles have been inpainted with plausible background, and
 2. an **SRT file** with the recognized subtitle text and frame-accurate timing.
@@ -47,7 +47,7 @@ It was built for a customer job: batch-process long videos on their own Windows 
 
 ### Input
 
-`cleanframe <path> [<path> ...] [-o OUT]`, where each path is a video file or a directory. Directories are scanned (non-recursively) for `.mp4 .mkv .mov .avi .flv .ts .m4v .wmv .webm`, sorted by name. Missing paths are skipped with a log line.
+`clean-clear [<path> ...] [-o OUT]`, where each path is a video file or a directory; without arguments the current directory is processed and the results are written to the current directory. Directories are scanned (non-recursively) for `.mp4 .mkv .mov .avi .flv .ts .m4v .wmv .webm`, sorted by name. Files whose name ends in `_clean` (results of earlier runs) are skipped, so input and output may be the same folder. Missing paths are skipped with a log line.
 
 ### Output (in `OUT`, default `./output`)
 
@@ -89,7 +89,7 @@ The process exit code is `0` if every file succeeded and `1` if at least one fai
 
 | ID | Requirement |
 |---|---|
-| FR-14 | `--watermark off` (default) leaves the video untouched. |
+| FR-14 | `--watermark off` leaves the watermark untouched; the default is `auto`. |
 | FR-15 | `--watermark auto` finds a static, opaque logo in the four corners by sampling frames across the video, and removes it on every frame. The mask is saved to `.cache` for inspection. |
 | FR-16 | `--watermark <mask.png>` uses a user-supplied mask instead (must have the video's exact size; white = watermark). This is the manual override when detection is wrong. |
 | FR-17 | If nothing is found, or the detected area is unreasonably large (> 5% of the frame), the video is processed without watermark removal and a log line says so. |
@@ -104,18 +104,20 @@ The process exit code is `0` if every file succeeded and `1` if at least one fai
 ## 6. Command-line interface
 
 ```
-cleanframe INPUT [INPUT ...] [-o OUT] [-m lama|propainter] [options]
+clean-clear [INPUT ...] [-o OUT] [-m propainter|lama] [options]
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
-| `-o, --out` | `output` | Output directory |
-| `-m, --model` | `lama` | Inpainting model: `lama` or `propainter` |
+| `INPUT ...` | current directory | Video files or directories |
+| `-o, --out` | current directory | Output directory |
+| `-m, --model` | `propainter` | Inpainting model: `propainter` or `lama` |
 | `--band` | `0.70,1.0` | Subtitle band (fractions or pixels), e.g. `0,0.3` for top subtitles |
 | `--device` | `auto` | `auto`, `cuda`, `dml`, `cpu` for OCR and LaMa (ProPainter uses CUDA if available) |
 | `--srt-only` | off | Extract subtitles only |
 | `--no-cache` | off | Ignore OCR and watermark caches |
-| `--watermark` | `off` | `off`, `auto`, or a mask image path |
+| `--watermark` | `auto` | `auto`, `off`, or a mask image path |
+| `--ocr-fixed-shape` | `auto` | Feed OCR recognition a fixed input shape (workaround for multi-second stalls per new shape seen on an RTX 5090); `auto` = on for compute capability 12+ |
 | `--ocr-interval` | `10` | Max frames to skip OCR while the band is unchanged (`1` = every frame) |
 | `--encoder`, `--crf` | `auto`, `18` | Encoder and quality |
 | `--mask` | `glyph` | `glyph` or `box` |
@@ -129,7 +131,9 @@ cleanframe INPUT [INPUT ...] [-o OUT] [-m lama|propainter] [options]
 | `--pp-ctx`, `--pp-pad` | `10`, `8` | Context frames per chunk side, extra frames around subtitle runs |
 | `--pp-margin` | `80` | Horizontal margin (px) around the subtitle when cropping |
 
-`run.bat` / `run.sh` are thin wrappers that activate the virtual environment and call `main.py`; `install.bat` / `install.sh` create the environment.
+`scripts/install.bat` / `scripts/install.sh` create the virtual environment and install the package in editable mode, which provides the `clean-clear` command (`python -m clean_clear` is equivalent).
+
+**Progress and logs.** Every 10 s each stage prints `[stage] done/total  pct  fps  elapsed  ETA` (the erase ETA is weighted, because subtitle frames cost about 15x more than pass-through frames); each video gets a `[k/N]` header and a summary with its elapsed time, the batch ends with the total time and the list of failed files. The same lines, with timestamps, are appended to `clean-clear.log` in the output directory. Library deprecation warnings are suppressed.
 
 ## 7. Model choice
 
@@ -204,3 +208,5 @@ Running two processes on the 5090 and splitting the batch across the customer's 
 | Union masks on shared frames | A subtitle was left visible on the frame shared by two subtitles |
 | Shot-cut-aware chunking | Dark blobs where the fill was copied from another shot |
 | Optional watermark removal | Customer request |
+| Defaults: ProPainter, watermark `auto`, current directory in and out | One command in the video folder |
+| Renamed to Clean Clear | Owner's decision |
