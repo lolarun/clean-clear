@@ -118,6 +118,9 @@ For each video the output directory contains:
 | `--extend-sec` | `3` | when OCR loses a subtitle for part of its time, keep erasing up to this many seconds before/after it while its glyphs are still visible; `0` = off |
 | `--verify` | `on` | after erasing, OCR the result again and erase any subtitle that is still readable (adds one cheap OCR pass; a second decode/encode only if something is found) |
 | `--wm-guard` | `25` | repair a watermark fill whose mean brightness differs from its surroundings by more than this many grey levels (dark-scene flashes); `0` = off |
+| `--jobs` | `1` | process a long video in this many concurrent processes (split into 2x this many parts at keyframes, merged afterwards; OCR runs in parallel too). On one L20 with 4 processes the GPU was saturated and the whole film took 2 h instead of 3 h+ |
+| `--keep-parts` | | with `--jobs`, keep the per-part work directory |
+| `--refine-of ORIGINAL` | | INPUT is an already cleaned video of ORIGINAL: erase any subtitle still readable in it and fill logo pixels the first pass missed, in one decode and one encode (writes `NAME_refined.mp4`). About 30 min for a 90-minute film, instead of a full rerun |
 | `--min-height` | `0.015` | minimum text height as a fraction of frame height |
 
 ## How it works

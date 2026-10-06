@@ -16,7 +16,9 @@ from .common import ROOT, __version__, fmt_time, log, set_log_file, usable_cpus
 for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(_var, str(min(8, usable_cpus())))
 from .device import gpu_compute_capability, onnx_providers
+from .parallel import process_parallel
 from .pipeline import process
+from .refine import refine
 from .subtitles import OCR
 from .video import VIDEO_EXTS, pick_encoder
 
@@ -101,6 +103,14 @@ def build_argparser():
                     help="frame interval between global reference frames fed to the transformer fusion step; "
                          "lower it for more temporal consistency (less flicker in dark/fast-motion scenes) at the "
                          "cost of speed and VRAM")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="process a long video in this many concurrent processes (it is split into 2x this many parts at "
+                         "keyframes, parts are merged afterwards). Uses the idle CPU/GPU capacity; videos shorter than "
+                         "2 min per part run normally (default: 1)")
+    ap.add_argument("--keep-parts", action="store_true", help="with --jobs, keep the per-part work directory")
+    ap.add_argument("--refine-of", metavar="ORIGINAL",
+                    help="INPUT is an already cleaned video of ORIGINAL: erase any subtitle still readable in it and fill "
+                         "logo pieces the first pass missed, in one decode/encode (writes NAME_refined.mp4)")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return ap
 
@@ -118,26 +128,38 @@ def main(argv=None):
     out_dir = Path(args.out)
     set_log_file(out_dir / "clean-clear.log")
     log(f"Clean Clear {__version__}: {len(files)} video(s) -> {out_dir.resolve()}")
-    device, prov = onnx_providers(args.device)
-    log(f"device: {device}  providers={prov}")
-    fixed = args.ocr_fixed_shape == "on" or (
-        args.ocr_fixed_shape == "auto" and device == "cuda" and gpu_compute_capability() >= 12.0)
-    if fixed:
-        log("OCR: fixed recognition input shape")
-    ocr = OCR(device, fixed_shape=fixed)
-    backend = encoder = None
-    if not args.srt_only:
-        backend = backends.create(args.model, providers=prov, propainter_dir=args.propainter_dir,
-                                  chunk=args.pp_chunk, raft_iter=args.pp_raft_iter,
-                                  ctx=args.pp_ctx, pad=args.pp_pad, margin=args.pp_margin,
-                                  ref_stride=args.pp_ref_stride)
-        encoder = pick_encoder(args.encoder)
-        log(f"model: {args.model}  encoder: {encoder}")
+    models = []
+
+    def load_models():  # lazily: with --jobs the part processes load their own, the parent keeps the GPU free
+        if not models:
+            device, prov = onnx_providers(args.device)
+            log(f"device: {device}  providers={prov}")
+            fixed = args.ocr_fixed_shape == "on" or (
+                args.ocr_fixed_shape == "auto" and device == "cuda" and gpu_compute_capability() >= 12.0)
+            if fixed:
+                log("OCR: fixed recognition input shape")
+            ocr = OCR(device, fixed_shape=fixed)
+            backend = encoder = None
+            if not args.srt_only:
+                backend = backends.create(args.model, providers=prov, propainter_dir=args.propainter_dir,
+                                          chunk=args.pp_chunk, raft_iter=args.pp_raft_iter,
+                                          ctx=args.pp_ctx, pad=args.pp_pad, margin=args.pp_margin,
+                                          ref_stride=args.pp_ref_stride)
+                encoder = pick_encoder(args.encoder)
+                log(f"model: {args.model}  encoder: {encoder}")
+            models.extend([ocr, backend, encoder])
+        return models
+
     out_dir = Path(args.out)
     failed = []
     for f in files:
         try:
-            process(f, out_dir, args, ocr, backend, encoder)
+            if args.refine_of:
+                refine(f, args.refine_of, out_dir, args, *load_models())
+                continue
+            if args.jobs > 1 and not args.srt_only and process_parallel(f, out_dir, args):
+                continue
+            process(f, out_dir, args, *load_models())
         except Exception as e:
             log(f"!! failed {f}: {e}")
             failed.append(f)

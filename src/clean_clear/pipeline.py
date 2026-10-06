@@ -66,6 +66,10 @@ def watermark_mask(src, out_dir, W, H, fps, n, args):
     else:
         t0 = time.time()
         found = watermark.detect(src, W, H, n / fps)
+        if found is not None:  # semi-transparent bits of the logo (a green tick) that the static-colour test misses
+            acc = watermark.leftover_accents(src, W, H, n / fps, found)
+            if acc is not None:
+                found = found | acc
         m = found if found is not None else np.zeros((H, W), bool)
         cache.parent.mkdir(exist_ok=True)
         cv2.imwrite(str(cache), m.astype(np.uint8) * 255)

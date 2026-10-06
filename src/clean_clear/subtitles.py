@@ -115,8 +115,10 @@ def filter_line(boxes, line):
     if line is None:
         return boxes
     mode, h = line
+    # Upper bound 1.6: a detector box that also swallows a light streak or edge next to the text (seen at 14:28 of
+    # the test film: 74 px against the usual 52 px) is still the subtitle; the position check below keeps scene text out
     keep = [b for b in boxes
-            if 0.75 * h <= b[3] - b[1] <= 1.33 * h
+            if 0.75 * h <= b[3] - b[1] <= 1.6 * h
             and mode - 2.5 * h <= (b[1] + b[3]) / 2 <= mode + 0.5 * h]
     main = [b for b in keep if abs((b[1] + b[3]) / 2 - mode) <= 0.5 * h]
     if not main:
@@ -142,6 +144,8 @@ def join_text(keep):
             cur = [b]
     lines.append(cur)
     text = "\n".join(" ".join(b[4] for b in sorted(l, key=lambda b: b[0])) for l in lines)
+    # a light streak or edge inside a detector box is read as a stray ASCII symbol at the end of the line
+    text = "\n".join(line.strip(" \\/|_`~") for line in text.split("\n")).strip("\n")
     return text, [b[:4] for b in keep]
 
 
