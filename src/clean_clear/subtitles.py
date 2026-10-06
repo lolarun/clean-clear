@@ -64,6 +64,14 @@ class Seg:
     end: int
     texts: Counter = field(default_factory=Counter)
     boxes: list = field(default_factory=list)  # (x0, y0, x1, y1) in full-frame coordinates
+    ext_lo: int = None  # first/last frame where the same glyphs are still on screen although OCR lost them
+    ext_hi: int = None
+
+    @property
+    def span(self):
+        """Frames to erase: the OCR range widened by the glyph-matched extension"""
+        return min(self.start, self.start if self.ext_lo is None else self.ext_lo), \
+            max(self.end, self.end if self.ext_hi is None else self.ext_hi)
 
     @property
     def text(self):
@@ -178,9 +186,11 @@ def build_segments(per_frame, max_gap, min_len):
     return [s for s in segs if s.end - s.start + 1 >= min_len]
 
 
-def segments_from_ocr(per_frame, fps, max_gap=5, min_dur=0.4):
-    """Raw per-frame OCR boxes -> (subtitle line, [Seg])"""
-    line = subtitle_line(per_frame)
+def segments_from_ocr(per_frame, fps, max_gap=5, min_dur=0.4, line="auto"):
+    """Raw per-frame OCR boxes -> (subtitle line, [Seg]). `line` = a known (y centre, height) to reuse
+    instead of detecting it, e.g. when checking an already cleaned video where almost no text is left"""
+    if line == "auto":
+        line = subtitle_line(per_frame)
     texts = [join_text(filter_line(list(b), line)) for b in per_frame]
     return line, build_segments(texts, max_gap=max_gap, min_len=max(2, round(min_dur * fps)))
 

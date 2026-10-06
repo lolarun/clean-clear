@@ -6,7 +6,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .common import Progress, log
+from .common import Progress, fmt_time, log
 from .masks import box_masks, frame_masks, glyph_masks, white_pixels
 from .subtitles import frame_boxes, segments_from_ocr, write_srt
 from . import watermark
@@ -22,7 +22,7 @@ def parse_band(s, H):
     return max(0, a), min(H, b)
 
 
-def run_ocr(src, W, H, n, band, ocr, args):
+def run_ocr(src, W, H, n, band, ocr, args, label="ocr"):
     """Pass 1: per-frame OCR boxes of the subtitle band. If the white-pixel layout barely changed since
     the last OCR'd frame, the subtitle is the same and the result is reused (OCR is still forced every
     --ocr-interval frames)."""
@@ -30,7 +30,7 @@ def run_ocr(src, W, H, n, band, ocr, args):
     per_frame = []
     min_h = max(8, int(H * args.min_height))
     ref, last, n_ocr, txt = None, -1, 0, ""
-    prog = Progress("ocr", n)
+    prog = Progress(label, n)
     for i, strip in enumerate(read_frames(src, W, H, band)):
         sig = white_pixels(strip[::2, ::2])
         if ref is not None and i - last < args.ocr_interval:
@@ -76,6 +76,38 @@ def watermark_mask(src, out_dir, W, H, fps, n, args):
     return m
 
 
+def verify_and_fix(src, dst, W, H, fps, n, band, line, cuts, args, ocr, backend, encoder):
+    """Second look at the finished video: OCR its subtitle band again. Whatever is still readable was missed by
+    the first pass (OCR lost it, mask too small, ...); it is erased in one more pass over the result."""
+    if line is None:
+        return
+    per_frame = run_ocr(dst, W, H, n, band, ocr, args, label="verify")
+    _, segs = segments_from_ocr(per_frame, fps, max_gap=args.max_gap, min_dur=args.min_dur * 0.5, line=line)
+    if not segs:
+        log("  verify: no subtitle left in the result")
+        return
+    log(f"  verify: {len(segs)} subtitle(s) still visible ({sum(s.end - s.start + 1 for s in segs)} frames) at "
+        + ", ".join(fmt_time(s.start / fps) for s in segs[:20]) + (" ..." if len(segs) > 20 else "") + "; erasing")
+    if args.mask == "glyph":
+        masks = glyph_masks(dst, W, H, band, segs, args.dilate, args.grow, args.shadow, total=n,
+                            extend=round(args.extend_sec * fps))
+    else:
+        masks = box_masks(segs, H, W, args.dilate)
+    frame_seg, masks = frame_masks(segs, masks, args.pad_frames)
+    tmp =dst.with_name(dst.stem + ".fix.mp4")
+    wr = open_writer(src, tmp, W, H, fps, encoder, args.crf)  # audio comes from the original again
+    tw = ThreadedWriter(wr)
+    try:
+        for frame in backend.erase(prefetch(read_frames(dst, W, H)), frame_seg, masks, cuts):
+            tw.write(np.ascontiguousarray(frame).tobytes())
+    finally:
+        tw.close()
+    if wr.returncode != 0:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"ffmpeg encoding failed in the verify pass (code {wr.returncode}); first-pass result kept")
+    tmp.replace(dst)
+
+
 def process(src, out_dir, args, ocr, backend, encoder):
     src = Path(src)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -105,7 +137,8 @@ def process(src, out_dir, args, ocr, backend, encoder):
     # One fixed mask per subtitle keeps the result temporally stable
     t0 = time.time()
     if args.mask == "glyph":
-        masks = glyph_masks(src, W, H, band, segs, args.dilate, args.grow, args.shadow, total=n)
+        masks = glyph_masks(src, W, H, band, segs, args.dilate, args.grow, args.shadow, total=n,
+                            extend=round(args.extend_sec * fps))
     else:
         masks = box_masks(segs, H, W, args.dilate)
     frame_seg, masks = frame_masks(segs, masks, args.pad_frames)
@@ -135,6 +168,8 @@ def process(src, out_dir, args, ocr, backend, encoder):
         if wm is not None:  # watermark: the same erase() on every frame; chained lazily, so still one decode + one encode
             log("  erasing watermark on every frame")
             stream = backend.erase(stream, {i: 0 for i in range(n + 50)}, {0: wm}, cuts)
+            if args.wm_guard > 0:
+                stream = watermark.guard_fill(stream, wm, args.wm_guard)
         for frame in backend.erase(stream, frame_seg, masks, cuts):
             tw.write(np.ascontiguousarray(frame).tobytes())
             written += 1
@@ -144,3 +179,8 @@ def process(src, out_dir, args, ocr, backend, encoder):
     if wr.returncode != 0:
         raise RuntimeError(f"ffmpeg encoding failed (code {wr.returncode})")
     log(f"  video -> {dst}  ({time.time() - t0:.0f}s, {backend.name})")
+
+    if args.verify == "on":
+        t0 = time.time()
+        verify_and_fix(src, dst, W, H, fps, n, band, line, cuts, args, ocr, backend, encoder)
+        log(f"  verify done ({time.time() - t0:.0f}s)")

@@ -15,11 +15,13 @@ It must yield exactly one output frame per input frame, in the same order.
 MODELS = ("lama", "propainter")
 
 
-def create(model, providers=None, propainter_dir=None, chunk=120, raft_iter=20, ctx=10, pad=8, margin=80):
+def create(model, providers=None, propainter_dir=None, chunk=120, raft_iter=20, ctx=10, pad=8, margin=80,
+           ref_stride=10):
     if model == "lama":
         from .lama import LamaBackend
         return LamaBackend(providers)
     if model == "propainter":
         from .propainter import ProPainterBackend
-        return ProPainterBackend(propainter_dir, chunk=chunk, raft_iter=raft_iter, ctx=ctx, pad=pad, margin=margin)
+        return ProPainterBackend(propainter_dir, chunk=chunk, raft_iter=raft_iter, ctx=ctx, pad=pad, margin=margin,
+                                  ref_stride=ref_stride)
     raise ValueError(f"unknown model: {model}")

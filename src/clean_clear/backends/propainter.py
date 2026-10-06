@@ -187,14 +187,15 @@ class ProPainterBackend:
     uses_cuts = True  # the pipeline passes shot cuts to erase()
     MIN_SIDE = 128    # smallest band height / crop width (px) handed to the models
 
-    def __init__(self, repo, chunk=120, raft_iter=20, ctx=10, pad=8, margin=80):
+    def __init__(self, repo, chunk=120, raft_iter=20, ctx=10, pad=8, margin=80, ref_stride=10):
         if not repo or not Path(repo).is_dir():
             sys.exit("ProPainter needs --propainter-dir pointing to a ProPainter checkout (see README)")
         self.chunk = chunk
         self.CTX = ctx    # context frames added on each side of a chunk
         self.PAD = pad    # extra frames inpainted around each run of subtitle frames
         self.margin = margin  # horizontal margin (px) kept around the subtitle when cropping columns
-        self.engine = ProPainterEngine(repo, raft_iter=raft_iter, subvideo_length=chunk + 2 * self.CTX)
+        self.engine = ProPainterEngine(repo, raft_iter=raft_iter, subvideo_length=chunk + 2 * self.CTX,
+                                        ref_stride=ref_stride)
 
     def _chunks(self, frame_seg, cuts=()):
         """Frames to inpaint -> runs (gaps <= 10 frames merged, PAD frames added at both ends)

@@ -115,6 +115,9 @@ For each video the output directory contains:
 | `--ocr-fixed-shape` | `auto` | feed OCR recognition one fixed input shape; works around multi-second stalls per new input shape observed on an RTX 5090 with onnxruntime-gpu 1.23 (`auto` = on for compute capability 12+) |
 | `--max-gap` | `5` | missed frames tolerated within one subtitle |
 | `--min-score` | `0.6` | OCR confidence threshold |
+| `--extend-sec` | `3` | when OCR loses a subtitle for part of its time, keep erasing up to this many seconds before/after it while its glyphs are still visible; `0` = off |
+| `--verify` | `on` | after erasing, OCR the result again and erase any subtitle that is still readable (adds one cheap OCR pass; a second decode/encode only if something is found) |
+| `--wm-guard` | `25` | repair a watermark fill whose mean brightness differs from its surroundings by more than this many grey levels (dark-scene flashes); `0` = off |
 | `--min-height` | `0.015` | minimum text height as a fraction of frame height |
 
 ## How it works

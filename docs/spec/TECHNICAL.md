@@ -124,6 +124,16 @@ for frame in backend.erase(stream, frame_seg, masks, cuts):  # subtitles
 - **Encoding** (`video.open_writer`): raw BGR on stdin, audio copied from the source (`-map 1:a?`, `-c:a copy`), NVENC `p5` VBR with `-cq` (`--crf`) and `-b:v 0` or libx264 `medium`, `yuv420p`, `+faststart`. `pick_encoder("auto")` tests NVENC with a 0.2 s synthetic clip and falls back to libx264.
 - A non-zero ffmpeg exit code raises, which the CLI loop records as a failed file.
 
+### 4.8 Safety nets added after customer review (v0.3.1, not yet measured on a GPU server)
+
+A customer spot-check of the first delivery found a subtitle left on screen and flicker in the subtitle and watermark areas. Frame statistics over the delivered video (white-pixel counts in the subtitle line, frame-to-frame change in the logo area against an untouched neighbouring patch) pointed to three causes, each with a countermeasure:
+
+1. **Subtitle partly erased.** In all 5 leftovers found in the first 63 minutes (e.g. 14:27.3, 42 frames) the first part of a sentence was erased and the rest was not: OCR stopped seeing the text but the same glyphs stayed on screen. `masks.glyph_masks(extend=...)` checks up to `--extend-sec` (3 s) of frames before/after every segment against that segment's own glyph pixels (>= 60 % of the strokes white, little white outside them, 2 bad frames tolerated) and widens the erase range (`Seg.ext_lo/ext_hi`, used by `frame_masks`). It runs inside the existing pass over the subtitle band, so it adds no decoding. The SRT keeps the OCR timing.
+2. **Anything still missed.** `pipeline.verify_and_fix` OCRs the finished video again with the first pass's subtitle line, and erases whatever is still readable in a second pass over the result (written to `*.fix.mp4`, then replacing the output; the first result is kept if the pass fails). It costs one more OCR pass (cheap, because a cleaned band rarely has white text, so most frames are skipped) and, only when something is found, one more decode and encode. `--verify off` disables it.
+3. **Bright flashes in the logo area.** In dark scenes the watermark fill came out as a bright logo-shaped blob for ~4 frames (seen at 42:34-42:36); in the first 63 minutes there were 75 isolated jumps above 5 grey levels in the output against 10 in the source. `watermark.guard_fill` compares the mean brightness inside the mask with a ring of untouched pixels around it and re-fills a frame with a spatial inpaint (`cv2.inpaint`) when they differ by more than `--wm-guard` (25) grey levels. This treats the symptom; the cause inside the model is not established. Chunk boundaries (every 120 frames) showed about 5x more jumps than other frames, but they account for only ~10 % of the jumps.
+
+Not supported by the data and therefore not changed: bridging OCR gaps inside a sentence (0 cases found), larger `--pad-frames`, and lowering `--pp-ref-stride` (no measurable effect on the flicker; it only makes the transformer step slower).
+
 ## 5. Backends
 
 ### 5.1 Interface (`backends/__init__.py`)

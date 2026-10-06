@@ -9,6 +9,40 @@ from .common import log
 from .video import _exe
 
 
+def guard_fill(frames, mask, thresh=25.0, margin=20):
+    """Safety net for the watermark erase step: yields the frames, repairing implausible fills.
+
+    In dark scenes the inpainting model was seen to fill the logo area with a bright blob for a few frames
+    (a 'flash' in the corner). A correct fill continues its surroundings, so its mean brightness is close
+    to that of a ring of untouched pixels around the mask. When the two differ by more than `thresh`
+    grey levels, the area is re-filled from the ring with a classic spatial inpaint (stable on the flat
+    backgrounds where the model fails, slightly blurry elsewhere)."""
+    ys, xs = np.nonzero(mask)
+    H, W = mask.shape
+    y0, y1 = max(0, ys.min() - margin), min(H, ys.max() + 1 + margin)
+    x0, x1 = max(0, xs.min() - margin), min(W, xs.max() + 1 + margin)
+    m = mask[y0:y1, x0:x1]
+    m8 = m.astype(np.uint8)
+    ell = lambda k: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    ring = cv2.dilate(m8, ell(31)).astype(bool) & ~cv2.dilate(m8, ell(9)).astype(bool)
+    fix = cv2.dilate(m8, ell(5))
+    if not ring.any():
+        yield from frames
+        return
+    fixed = 0
+    for f in frames:
+        crop = f[y0:y1, x0:x1]
+        grey = crop.mean(2)
+        if abs(float(grey[m].mean()) - float(grey[ring].mean())) > thresh:
+            if not f.flags.writeable:
+                f = f.copy()
+            f[y0:y1, x0:x1] = cv2.inpaint(np.ascontiguousarray(f[y0:y1, x0:x1]), fix, 5, cv2.INPAINT_TELEA)
+            fixed += 1
+        yield f
+    if fixed:
+        log(f"  watermark guard repaired {fixed} frame(s) where the fill did not match its surroundings")
+
+
 def _grab(src, t, W, H):
     r = subprocess.run([_exe("ffmpeg"), "-v", "error", "-ss", f"{t:.2f}", "-i", str(src), "-frames:v", "1",
                         "-f", "rawvideo", "-pix_fmt", "bgr24", "-"], capture_output=True)

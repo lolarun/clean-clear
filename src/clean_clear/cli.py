@@ -69,6 +69,14 @@ def build_argparser():
     ap.add_argument("--max-gap", type=int, default=5, help="missed frames tolerated within one subtitle")
     ap.add_argument("--min-dur", type=float, default=0.4,
                     help="subtitles shorter than this many seconds are treated as noise")
+    ap.add_argument("--extend-sec", type=float, default=3.0,
+                    help="when OCR loses a subtitle part of the time, keep erasing for up to this many seconds before/after "
+                         "it while its glyphs are still visible (0 = off, glyph masks only)")
+    ap.add_argument("--verify", default="on", choices=["on", "off"],
+                    help="after erasing, OCR the result again and erase any subtitle that is still readable (default: on)")
+    ap.add_argument("--wm-guard", type=float, default=25.0,
+                    help="repair watermark fills whose mean brightness differs from their surroundings by more than this many "
+                         "grey levels (0 = off)")
     ap.add_argument("--min-score", type=float, default=0.6, help="OCR confidence threshold")
     ap.add_argument("--min-height", type=float, default=0.015, help="minimum text height as a fraction of frame height")
 
@@ -89,6 +97,10 @@ def build_argparser():
                     help="extra frames inpainted before/after each run of subtitle frames")
     pp.add_argument("--pp-margin", type=int, default=80,
                     help="horizontal margin (px) kept around the subtitle when cropping columns to process")
+    pp.add_argument("--pp-ref-stride", type=int, default=10,
+                    help="frame interval between global reference frames fed to the transformer fusion step; "
+                         "lower it for more temporal consistency (less flicker in dark/fast-motion scenes) at the "
+                         "cost of speed and VRAM")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return ap
 
@@ -117,7 +129,8 @@ def main(argv=None):
     if not args.srt_only:
         backend = backends.create(args.model, providers=prov, propainter_dir=args.propainter_dir,
                                   chunk=args.pp_chunk, raft_iter=args.pp_raft_iter,
-                                  ctx=args.pp_ctx, pad=args.pp_pad, margin=args.pp_margin)
+                                  ctx=args.pp_ctx, pad=args.pp_pad, margin=args.pp_margin,
+                                  ref_stride=args.pp_ref_stride)
         encoder = pick_encoder(args.encoder)
         log(f"model: {args.model}  encoder: {encoder}")
     out_dir = Path(args.out)
