@@ -10,6 +10,8 @@ from .common import Progress, fmt_time, log
 from .masks import box_masks, frame_masks, glyph_masks, white_pixels
 from .subtitles import frame_boxes, segments_from_ocr, write_srt
 from . import watermark
+from .rewrite import rewrite
+from .stabilize import stabilize
 from .video import ThreadedWriter, detect_cuts, open_writer, prefetch, probe, read_frames
 
 
@@ -98,18 +100,28 @@ def verify_and_fix(src, dst, W, H, fps, n, band, line, cuts, args, ocr, backend,
     else:
         masks = box_masks(segs, H, W, args.dilate)
     frame_seg, masks = frame_masks(segs, masks, args.pad_frames)
-    tmp =dst.with_name(dst.stem + ".fix.mp4")
-    wr = open_writer(src, tmp, W, H, fps, encoder, args.crf)  # audio comes from the original again
-    tw = ThreadedWriter(wr)
-    try:
-        for frame in backend.erase(prefetch(read_frames(dst, W, H)), frame_seg, masks, cuts):
-            tw.write(np.ascontiguousarray(frame).tobytes())
-    finally:
-        tw.close()
-    if wr.returncode != 0:
-        tmp.unlink(missing_ok=True)
-        raise RuntimeError(f"ffmpeg encoding failed in the verify pass (code {wr.returncode}); first-pass result kept")
+    tmp = dst.with_name(dst.stem + ".fix.mp4")
+
+    def fix(frames, a, b):  # one keyframe-aligned window; indices relative to its first frame
+        fs = {i - a: k for i, k in frame_seg.items() if a <= i < b}
+        cw = [c - a for c in cuts if a < c < b]
+        return stabilize(backend.erase(frames, fs, masks, cw), fs, masks, cw, args.stabilize, label="verify")
+
+    # only the windows around the residual subtitles are re-encoded; the rest of the file is copied untouched
+    rewrite(dst, src, tmp, [(min(frame_seg_k), max(frame_seg_k)) for frame_seg_k in _runs(frame_seg)],
+            fix, encoder, args.crf)
     tmp.replace(dst)
+
+
+def _runs(frame_seg, gap=10):
+    """Frame indices of `frame_seg` grouped into runs (gaps <= `gap` frames joined)"""
+    runs = []
+    for i in sorted(frame_seg):
+        if runs and i - runs[-1][-1] <= gap:
+            runs[-1].append(i)
+        else:
+            runs.append([i])
+    return runs
 
 
 def process(src, out_dir, args, ocr, backend, encoder):
@@ -174,7 +186,10 @@ def process(src, out_dir, args, ocr, backend, encoder):
             stream = backend.erase(stream, {i: 0 for i in range(n + 50)}, {0: wm}, cuts)
             if args.wm_guard > 0:
                 stream = watermark.guard_fill(stream, wm, args.wm_guard)
-        for frame in backend.erase(stream, frame_seg, masks, cuts):
+            stream = stabilize(stream, {i: 0 for i in range(n + 50)}, {0: wm}, cuts, args.stabilize, label="watermark")
+        stream = stabilize(backend.erase(stream, frame_seg, masks, cuts), frame_seg, masks, cuts, args.stabilize,
+                           label="subtitles")
+        for frame in stream:
             tw.write(np.ascontiguousarray(frame).tobytes())
             written += 1
             prog.update(written)

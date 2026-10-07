@@ -79,6 +79,9 @@ def build_argparser():
     ap.add_argument("--wm-guard", type=float, default=25.0,
                     help="repair watermark fills whose mean brightness differs from their surroundings by more than this many "
                          "grey levels (0 = off)")
+    ap.add_argument("--stabilize", type=float, default=0.6,
+                    help="blend each inpainted area with the previous frame by up to this weight where the surroundings are "
+                         "static, against the frame-to-frame shimmer of the fill (0 = off)")
     ap.add_argument("--min-score", type=float, default=0.6, help="OCR confidence threshold")
     ap.add_argument("--min-height", type=float, default=0.015, help="minimum text height as a fraction of frame height")
 

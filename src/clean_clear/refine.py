@@ -11,10 +11,12 @@ import numpy as np
 
 from .common import fmt_time, log
 from .masks import box_masks, frame_masks, glyph_masks
-from .pipeline import parse_band, run_ocr
+from .pipeline import _runs, parse_band, run_ocr
 from .subtitles import frame_boxes, segments_from_ocr, subtitle_line
 from .video import ThreadedWriter, _exe, detect_cuts, open_writer, prefetch, probe, read_frames
 from . import watermark
+from .rewrite import rewrite
+from .stabilize import stabilize
 
 
 def estimate_line(src, W, H, band, ocr, args, duration, samples=300):
@@ -73,19 +75,30 @@ def refine(cleaned, original, out_dir, args, ocr, backend, encoder):
 
     cuts = detect_cuts(cleaned, total=n) if getattr(backend, "uses_cuts", False) and frame_seg else []
     dst = out_dir / (cleaned.stem.removesuffix("_clean") + "_refined.mp4")
-    wr = open_writer(original, dst, W, H, fps, encoder, args.crf)  # audio from the original
-    tw = ThreadedWriter(wr)
-    try:
-        stream = prefetch(read_frames(cleaned, W, H))
-        if extra is not None:
-            stream = watermark.spatial_fill(stream, extra)
-        if frame_seg:
-            stream = backend.erase(stream, frame_seg, masks, cuts)
-        for frame in stream:
-            tw.write(np.ascontiguousarray(frame).tobytes())
-    finally:
-        tw.close()
-    if wr.returncode != 0:
-        raise RuntimeError(f"ffmpeg encoding failed (code {wr.returncode})")
+    if extra is None:  # only subtitles to fix: re-encode just the windows around them, copy the rest
+        if not frame_seg:
+            log("  nothing to fix")
+            return None
+
+        def fix(frames, a, b):
+            fs = {i - a: k for i, k in frame_seg.items() if a <= i < b}
+            cw = [c - a for c in cuts if a < c < b]
+            return stabilize(backend.erase(frames, fs, masks, cw), fs, masks, cw, args.stabilize, label="refine")
+
+        rewrite(cleaned, original, dst, [(min(r), max(r)) for r in _runs(frame_seg)], fix, encoder, args.crf)
+    else:  # logo pixels change on every frame: one full pass
+        wr = open_writer(original, dst, W, H, fps, encoder, args.crf)  # audio from the original
+        tw = ThreadedWriter(wr)
+        try:
+            stream = watermark.spatial_fill(prefetch(read_frames(cleaned, W, H)), extra)
+            if frame_seg:
+                stream = stabilize(backend.erase(stream, frame_seg, masks, cuts), frame_seg, masks, cuts,
+                                   args.stabilize, label="refine")
+            for frame in stream:
+                tw.write(np.ascontiguousarray(frame).tobytes())
+        finally:
+            tw.close()
+        if wr.returncode != 0:
+            raise RuntimeError(f"ffmpeg encoding failed (code {wr.returncode})")
     log(f"  refined video -> {dst}  ({time.time() - t0:.0f}s)")
     return dst

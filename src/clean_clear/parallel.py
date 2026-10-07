@@ -19,7 +19,7 @@ from .video import _exe, probe
 # options forwarded to the part processes (argparse dest names)
 _VALUE_OPTS = ["model", "band", "device", "ocr_interval", "ocr_fixed_shape", "encoder", "crf", "mask", "dilate",
                "grow", "shadow", "pad_frames", "max_gap", "min_dur", "min_score", "min_height", "extend_sec",
-               "verify", "wm_guard", "propainter_dir", "pp_chunk", "pp_raft_iter", "pp_ctx", "pp_pad",
+               "verify", "wm_guard", "stabilize", "propainter_dir", "pp_chunk", "pp_raft_iter", "pp_ctx", "pp_pad",
                "pp_margin", "pp_ref_stride"]
 _SRT_TIME = re.compile(r"(\d+):(\d\d):(\d\d),(\d{3}) --> (\d+):(\d\d):(\d\d),(\d{3})")
 

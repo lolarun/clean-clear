@@ -42,9 +42,20 @@ def probe(path):
     return int(s["width"]), int(s["height"]), fps, n
 
 
-def read_frames(path, w, h, crop=None):
-    """Yield frames as read-only BGR ndarrays. With crop=(y0, y1) only that horizontal band is decoded."""
-    cmd = [_exe("ffmpeg"), "-v", "error", "-i", str(path), "-map", "0:v:0"]
+# Exact YUV<->RGB rounding. With the default flags every decode/encode round trip made the picture ~1.5 luma
+# levels darker, so a film that went through three passes ended up ~4.4 levels darker than its source.
+SWS = ["-sws_flags", "accurate_rnd+full_chroma_int+bitexact"]
+
+
+def read_frames(path, w, h, crop=None, start=0, count=0):
+    """Yield frames as read-only BGR ndarrays. With crop=(y0, y1) only that horizontal band is decoded.
+    start/count: decode only frames start .. start+count-1 (frame-exact for the constant-rate files we write)."""
+    cmd = [_exe("ffmpeg"), "-v", "error", *SWS]
+    if start:
+        cmd += ["-ss", f"{(start - 0.25) / _fps(path):.6f}"]  # a quarter frame early: output starts exactly at frame `start`
+    cmd += ["-i", str(path), "-map", "0:v:0"]
+    if count:
+        cmd += ["-frames:v", str(count)]
     if crop:
         y0, y1 = crop
         cmd += ["-vf", f"crop={w}:{y1 - y0}:0:{y0}"]
@@ -173,14 +184,27 @@ def pick_encoder(want):
     return "libx264"
 
 
-def open_writer(src, dst, w, h, fps, encoder, crf):
-    """ffmpeg process that encodes raw BGR frames from stdin and copies the audio of `src`."""
+def _fps(path):
+    return probe(path)[2]
+
+
+def keyframes(path):
+    """Frame indices of the keyframes of a constant-frame-rate video"""
+    fps = _fps(path)
+    out = subprocess.run([_exe("ffprobe"), "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
+                          "-show_entries", "frame=pts_time", "-of", "csv=p=0", str(path)],
+                         capture_output=True, text=True, check=True).stdout
+    return sorted({round(float(x.strip(",")) * fps) for x in out.split() if x.strip(",")})
+
+
+def open_writer(src, dst, w, h, fps, encoder, crf, audio=True):
+    """ffmpeg process that encodes raw BGR frames from stdin and copies the audio of `src` (audio=False: video only)."""
     if encoder in ("h264_nvenc", "hevc_nvenc"):
         venc = ["-c:v", encoder, "-preset", "p5", "-rc", "vbr", "-cq", str(crf), "-b:v", "0"]
     else:
         venc = ["-c:v", encoder, "-preset", "medium", "-crf", str(crf)]
-    cmd = [_exe("ffmpeg"), "-v", "error", "-y",
-           "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", f"{fps:.6f}", "-i", "-",
-           "-i", str(src), "-map", "0:v:0", "-map", "1:a?", "-c:a", "copy",
-           *venc, "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(dst)]
+    cmd = [_exe("ffmpeg"), "-v", "error", "-y", *SWS,
+           "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", f"{fps:.6f}", "-i", "-"]
+    cmd += ["-i", str(src), "-map", "0:v:0", "-map", "1:a?", "-c:a", "copy"] if audio else ["-map", "0:v:0"]
+    cmd += [*venc, "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(dst)]
     return subprocess.Popen(cmd, stdin=subprocess.PIPE)

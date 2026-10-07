@@ -140,6 +140,15 @@ A customer spot-check of the first delivery found a subtitle left on screen and 
 
 Not supported by the data and therefore not changed: bridging OCR gaps inside a sentence (0 cases found), larger `--pad-frames`, and lowering `--pp-ref-stride` (no measurable effect on the flicker; it only makes the transformer step slower).
 
+### 4.9 Third customer review (v0.3.3, not yet measured on a GPU server)
+
+"Hardly visible, but at 2x speed it flickers at 45:08, 51:48-52:00, 54:30." Frame-exact comparison of the delivery with the source (time-based decoding; OpenCV frame seeking was off by several frames on these MP4s):
+
+- **Shimmer of the subtitle fill.** No repeated or dropped frames, no brightness steps, and the logo corner changed only slightly. In the erased subtitle area the result changed 1.5-2.5x as much from frame to frame as the source does there (e.g. 1.3-2.9 against 1.1-1.2 grey levels at 51:48), worst right after shot cuts inside a subtitle (45:05, 54:26). `stabilize.stabilize` blends each filled pixel with the previous output frame, weighted by how static an untouched ring around the area is (weight `--stabilize` on a still background, falling to 0 at a mean ring change of 6 grey levels), and restarts at shot cuts and at every new mask. Used for the watermark and the subtitle areas.
+- **The film was 4.3 luma levels darker than the source.** Every YUV->RGB->YUV round trip with ffmpeg's default swscale flags lowered luma by ~1.5 levels (measured: -1.54, -2.96, -4.37 after 1-3 round trips); with `accurate_rnd+full_chroma_int+bitexact` it is -0.05 and does not accumulate. `video.SWS` adds these flags to every decode and encode. Values outside 16-235 in the source are still clipped by the RGB conversion.
+- **Fewer generations.** The verify pass and `--refine-of` re-encoded the whole file for a few subtitles. `rewrite.rewrite` now re-encodes only keyframe-aligned windows around the changed frames and stream-copies the rest; pieces are cut by frame count (a time cut at a keyframe carried 3 packets of the next GOP and broke the seam).
+- Audio/video sync is fine: the source has 17 one-frame gaps (0.72 s in total) and the result is constant-rate, which puts the picture at most 41 ms off the audio.
+
 ## 5. Backends
 
 ### 5.1 Interface (`backends/__init__.py`)
