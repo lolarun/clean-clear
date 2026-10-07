@@ -119,7 +119,7 @@ For each video the output directory contains:
 | `--verify` | `on` | after erasing, OCR the result again and erase any subtitle that is still readable (adds one cheap OCR pass; a second decode/encode only if something is found) |
 | `--wm-guard` | `25` | repair a watermark fill whose mean brightness differs from its surroundings by more than this many grey levels (dark-scene flashes); `0` = off |
 | `--stabilize` | `0.6` | blend every inpainted area with the previous frame by up to this weight where its surroundings are static; reduces the frame-to-frame shimmer of the fill that shows at 2x playback. `0` = off |
-| `--jobs` | `1` | process a long video in this many concurrent processes (split into 2x this many parts at keyframes, merged afterwards; OCR runs in parallel too). On one L20 with 4 processes the GPU was saturated and the whole film took 2 h instead of 3 h+ |
+| `--jobs` | `1` | process a long video in this many concurrent processes (split into 2x this many parts at keyframes, merged afterwards; OCR runs in parallel too). On one L20 with 4 processes the GPU was saturated and the whole film took 2 h instead of 3 h+. See [Parallel runs and NVIDIA MPS](#parallel-runs-and-nvidia-mps) |
 | `--keep-parts` | | with `--jobs`, keep the per-part work directory |
 | `--refine-of ORIGINAL` | | INPUT is an already cleaned video of ORIGINAL: erase any subtitle still readable in it and fill logo pixels the first pass missed, in one decode and one encode (writes `NAME_refined.mp4`). About 30 min for a 90-minute film, instead of a full rerun |
 | `--min-height` | `0.015` | minimum text height as a fraction of frame height |
@@ -146,6 +146,34 @@ Test clip: 1920×1080, 25 fps, 5 minutes, ~100 subtitles.
 |---|---|---|---|
 | NVIDIA A10 | 154 s | 363 s | ~8.6 min |
 | RTX 3050 (estimated) | | | ~20–25 min |
+
+### Parallel runs and NVIDIA MPS
+
+On a big machine one process leaves most of it idle, so long videos run faster with `--jobs`. Measured on an NVIDIA L20 (16 vCPU, 46 GB) with a 90-minute 720p film: 4 processes finished in 2 h 8 min, a single process took over 3 h. More than 4 processes did not help, because the GPU is then the limit.
+
+Several processes on one GPU take turns by default: their kernels never run at the same time, and the small crops Clean Clear works on leave much of the GPU unused (utilisation shows ~100 %, power stays at ~65 %). NVIDIA's Multi-Process Service (MPS) lets them run concurrently. Clean Clear does not start it, because it is a machine-wide service that needs root and affects every CUDA program on that GPU. To use it on Linux:
+
+```bash
+# start MPS (as root), then run as usual
+export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-log
+mkdir -p $CUDA_MPS_PIPE_DIRECTORY $CUDA_MPS_LOG_DIRECTORY
+nvidia-cuda-mps-control -d
+clean-clear /data/videos -o /data/output --jobs 4
+
+# stop MPS afterwards
+echo quit | nvidia-cuda-mps-control
+```
+
+Measured on the same L20 with 90-second clips (other work was running on the machine at the time, so treat the numbers as indicative):
+
+| Setup | Time | Note |
+|---|---|---|
+| 4 processes, no MPS | 491 s | |
+| 4 processes, MPS | 420 s | about 14 % faster |
+| 8 processes, MPS | slower per clip than 4 | no gain, 30 GB GPU memory |
+| 4 processes, MPS, `--pp-chunk 240` | 451 s | larger chunks were slower |
+
+Recommendation: `--jobs 4` with MPS on a 16-core machine with one GPU. If MPS cannot be started (e.g. no root in a container), `--jobs 4` alone still helps.
 
 ## ProPainter model (optional)
 
