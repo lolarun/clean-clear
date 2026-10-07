@@ -44,16 +44,17 @@ def probe(path):
 
 # Exact YUV<->RGB rounding. With the default flags every decode/encode round trip made the picture ~1.5 luma
 # levels darker, so a film that went through three passes ended up ~4.4 levels darker than its source.
+# The flags must follow the input: placed before -i, ffmpeg 6.1 silently ignores them.
 SWS = ["-sws_flags", "accurate_rnd+full_chroma_int+bitexact"]
 
 
 def read_frames(path, w, h, crop=None, start=0, count=0):
     """Yield frames as read-only BGR ndarrays. With crop=(y0, y1) only that horizontal band is decoded.
     start/count: decode only frames start .. start+count-1 (frame-exact for the constant-rate files we write)."""
-    cmd = [_exe("ffmpeg"), "-v", "error", *SWS]
+    cmd = [_exe("ffmpeg"), "-v", "error"]
     if start:
         cmd += ["-ss", f"{(start - 0.25) / _fps(path):.6f}"]  # a quarter frame early: output starts exactly at frame `start`
-    cmd += ["-i", str(path), "-map", "0:v:0"]
+    cmd += ["-i", str(path), *SWS, "-map", "0:v:0"]  # -sws_flags only takes effect after the input (ffmpeg 6.1)
     if count:
         cmd += ["-frames:v", str(count)]
     if crop:
@@ -74,39 +75,48 @@ def read_frames(path, w, h, crop=None, start=0, count=0):
         p.wait()
 
 
-def detect_cuts(path, threshold=12.0, ratio=3.0, window=5, total=0):
+def detect_cuts(path, threshold=12.0, ratio=3.0, window=5, total=0, hist_min=0.2):
     """Shot cut detection: frame indices that start a new shot.
 
-    Consecutive frames are compared as 320x180 grayscale (mean absolute difference, 0-255 scale).
-    A cut is a spike: the difference exceeds `threshold` AND is `ratio` times the local level
-    (median of the `window` differences on each side). Normal motion stays below ~5 and hard cuts
-    are usually 15-30+; the spike rule rejects sustained fast motion, fire or flashes, which would
-    otherwise split chunks needlessly."""
+    Consecutive frames are compared as 320x180 images. A cut is a spike of the mean absolute grey difference
+    (above `threshold`, 0-255 scale) that is also either `ratio` times the local level of that difference
+    (median of the `window` values on each side), or a spike of the colour-histogram distance (Bhattacharyya,
+    above `hist_min` and `ratio` times its local level). The grey test alone missed a hard cut right after fast
+    motion (54:41 of the test film: 39.4 against 15-23 around it); the colour distribution barely changes during
+    motion (0.06-0.09 there) but jumps at the cut (0.33). Sustained fast motion, fire or flashes do not split chunks."""
+    import cv2
     w, h = 320, 180
     cmd = [_exe("ffmpeg"), "-v", "error", "-i", str(path), "-map", "0:v:0", "-vf", f"scale={w}:{h}",
-           "-f", "rawvideo", "-pix_fmt", "gray", "-"]
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=w * h * 16)
-    diffs, prev = [], None
+           "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=w * h * 3 * 16)
+    diffs, hdiffs, prev, prev_h = [], [], None, None
     prog = Progress("cuts", total) if total else None
     try:
         while True:
-            buf = p.stdout.read(w * h)
-            if len(buf) < w * h:
+            buf = p.stdout.read(w * h * 3)
+            if len(buf) < w * h * 3:
                 break
-            cur = np.frombuffer(buf, np.uint8).astype(np.int16)
+            img = np.frombuffer(buf, np.uint8).reshape(h, w, 3)
+            cur = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.int16)
+            hist = cv2.calcHist([cv2.cvtColor(img, cv2.COLOR_BGR2HSV)], [0, 1], None, [16, 8], [0, 180, 0, 256])
+            cv2.normalize(hist, hist)
             if prev is not None:
                 diffs.append(float(np.abs(cur - prev).mean()))  # diffs[j]: frame j -> j + 1
+                hdiffs.append(float(cv2.compareHist(prev_h, hist, cv2.HISTCMP_BHATTACHARYYA)))
                 if prog:
                     prog.update(len(diffs) + 1)
-            prev = cur
+            prev, prev_h = cur, hist
     finally:
         p.stdout.close()
         p.wait()
-    d = np.array(diffs)
+    d, hd = np.array(diffs), np.array(hdiffs)
     cuts = []
     for j in np.nonzero(d > threshold)[0]:
         around = np.r_[d[max(0, j - window):j], d[j + 1:j + 1 + window]]
-        if len(around) == 0 or d[j] > ratio * max(float(np.median(around)), 2.0):
+        h_around = np.r_[hd[max(0, j - window):j], hd[j + 1:j + 1 + window]]
+        grey_spike = len(around) == 0 or d[j] > ratio * max(float(np.median(around)), 2.0)
+        colour_spike = hd[j] > hist_min and (len(h_around) == 0 or hd[j] > ratio * max(float(np.median(h_around)), 0.03))
+        if grey_spike or colour_spike:
             cuts.append(int(j) + 1)
     return cuts
 
@@ -189,12 +199,12 @@ def _fps(path):
 
 
 def keyframes(path):
-    """Frame indices of the keyframes of a constant-frame-rate video"""
+    """{frame index: exact pts_time string} of the keyframes of a constant-frame-rate video"""
     fps = _fps(path)
     out = subprocess.run([_exe("ffprobe"), "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
                           "-show_entries", "frame=pts_time", "-of", "csv=p=0", str(path)],
                          capture_output=True, text=True, check=True).stdout
-    return sorted({round(float(x.strip(",")) * fps) for x in out.split() if x.strip(",")})
+    return {round(float(x.strip(",")) * fps): x.strip(",") for x in out.split() if x.strip(",")}
 
 
 def open_writer(src, dst, w, h, fps, encoder, crf, audio=True):
@@ -203,8 +213,8 @@ def open_writer(src, dst, w, h, fps, encoder, crf, audio=True):
         venc = ["-c:v", encoder, "-preset", "p5", "-rc", "vbr", "-cq", str(crf), "-b:v", "0"]
     else:
         venc = ["-c:v", encoder, "-preset", "medium", "-crf", str(crf)]
-    cmd = [_exe("ffmpeg"), "-v", "error", "-y", *SWS,
+    cmd = [_exe("ffmpeg"), "-v", "error", "-y",
            "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", f"{fps:.6f}", "-i", "-"]
-    cmd += ["-i", str(src), "-map", "0:v:0", "-map", "1:a?", "-c:a", "copy"] if audio else ["-map", "0:v:0"]
+    cmd += ["-i", str(src), *SWS, "-map", "0:v:0", "-map", "1:a?", "-c:a", "copy"] if audio else [*SWS, "-map", "0:v:0"]
     cmd += [*venc, "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(dst)]
     return subprocess.Popen(cmd, stdin=subprocess.PIPE)

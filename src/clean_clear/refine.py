@@ -15,7 +15,7 @@ from .pipeline import _runs, parse_band, run_ocr
 from .subtitles import frame_boxes, segments_from_ocr, subtitle_line
 from .video import ThreadedWriter, _exe, detect_cuts, open_writer, prefetch, probe, read_frames
 from . import watermark
-from .rewrite import rewrite
+from .rewrite import plain_timeline, rewrite
 from .stabilize import stabilize
 
 
@@ -75,10 +75,13 @@ def refine(cleaned, original, out_dir, args, ocr, backend, encoder):
 
     cuts = detect_cuts(cleaned, total=n) if getattr(backend, "uses_cuts", False) and frame_seg else []
     dst = out_dir / (cleaned.stem.removesuffix("_clean") + "_refined.mp4")
+    if extra is None and not frame_seg:
+        log("  nothing to fix")
+        return None
+    if extra is None and not plain_timeline(cleaned):
+        log("  input has hidden pre-roll frames (stream-copy cut): re-encoding the whole file instead of windows")
+        extra = np.zeros((H, W), bool)  # take the full pass below; an empty fill mask changes nothing
     if extra is None:  # only subtitles to fix: re-encode just the windows around them, copy the rest
-        if not frame_seg:
-            log("  nothing to fix")
-            return None
 
         def fix(frames, a, b):
             fs = {i - a: k for i, k in frame_seg.items() if a <= i < b}
@@ -90,7 +93,9 @@ def refine(cleaned, original, out_dir, args, ocr, backend, encoder):
         wr = open_writer(original, dst, W, H, fps, encoder, args.crf)  # audio from the original
         tw = ThreadedWriter(wr)
         try:
-            stream = watermark.spatial_fill(prefetch(read_frames(cleaned, W, H)), extra)
+            stream = prefetch(read_frames(cleaned, W, H))
+            if extra.any():
+                stream = watermark.spatial_fill(stream, extra)
             if frame_seg:
                 stream = stabilize(backend.erase(stream, frame_seg, masks, cuts), frame_seg, masks, cuts,
                                    args.stabilize, label="refine")
