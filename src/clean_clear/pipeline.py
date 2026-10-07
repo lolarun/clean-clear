@@ -84,7 +84,8 @@ def watermark_mask(src, out_dir, W, H, fps, n, args):
 
 def verify_and_fix(src, dst, W, H, fps, n, band, line, cuts, args, ocr, backend, encoder):
     """Second look at the finished video: OCR its subtitle band again. Whatever is still readable was missed by
-    the first pass (OCR lost it, mask too small, ...); it is erased in one more pass over the result."""
+    the first pass (OCR lost it, mask too small, ...); it is erased in one more pass that re-encodes only the
+    keyframe windows around it and copies the rest of the file."""
     if line is None:
         return
     per_frame = run_ocr(dst, W, H, n, band, ocr, args, label="verify")
@@ -108,8 +109,7 @@ def verify_and_fix(src, dst, W, H, fps, n, band, line, cuts, args, ocr, backend,
         return stabilize(backend.erase(frames, fs, masks, cw), fs, masks, cw, args.stabilize, label="verify")
 
     # only the windows around the residual subtitles are re-encoded; the rest of the file is copied untouched
-    rewrite(dst, src, tmp, [(min(frame_seg_k), max(frame_seg_k)) for frame_seg_k in _runs(frame_seg)],
-            fix, encoder, args.crf)
+    rewrite(dst, src, tmp, [(min(r), max(r)) for r in _runs(frame_seg)], fix, encoder, args.crf)
     tmp.replace(dst)
 
 

@@ -62,12 +62,15 @@ def spatial_fill(frames, mask, radius=3, margin=12):
         yield f
 
 
-def leftover_accents(src, W, H, duration, mask, samples=120, ring=11, frac=0.05):
+def leftover_accents(src, W, H, duration, mask, samples=200, ring=11, frac=0.05, dark_frac=0.3, dark=60):
     """-> HxW bool mask of small saturated bright pieces of the logo (e.g. a green tick) lying just outside `mask`.
 
     They are semi-transparent, so their colour changes with the background and the 'same colour in 85 % of the
-    frames' test of `detect` misses them; but in a ring around the logo a pixel that is saturated and bright in
-    `frac` of the sampled frames is part of the logo, not of the scene."""
+    frames' test of `detect` misses them. They stand out on dark backgrounds: in a ring around the logo, a pixel
+    that is much brighter than the background in `dark_frac` of the sampled frames whose ring is dark (median grey
+    < `dark`), or saturated and bright in
+    `frac` of all sampled frames, is part of the logo, not of the scene. (Counting all frames only missed the tip of
+    the tick in a film with mostly bright scenes: it was saturated in under 5 % of them.)"""
     ys, xs = np.nonzero(mask)
     y0, y1 = max(0, ys.min() - ring - 8), min(H, ys.max() + 1 + ring + 8)
     x0, x1 = max(0, xs.min() - ring - 8), min(W, xs.max() + 1 + ring + 8)
@@ -79,10 +82,19 @@ def leftover_accents(src, W, H, duration, mask, samples=120, ring=11, frac=0.05)
     if len(frames) < 20:
         return None
     hits = np.zeros(m.shape, np.int32)
+    dark_hits, n_dark = np.zeros(m.shape, np.int32), 0
     for f in frames:
-        hsv = cv2.cvtColor(np.ascontiguousarray(f[y0:y1, x0:x1]), cv2.COLOR_BGR2HSV)
+        crop = np.ascontiguousarray(f[y0:y1, x0:x1])
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         hits += (hsv[:, :, 1] > 128) & (hsv[:, :, 2] > 100)
+        grey = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        bg = float(np.median(grey[ring_m]))
+        if bg < dark:  # on a dark background any logo piece is simply much brighter than its surroundings
+            dark_hits += grey > max(80.0, bg + 50.0)
+            n_dark += 1
     acc = ring_m & (hits >= frac * len(frames))
+    if n_dark >= 8:
+        acc |= ring_m & (dark_hits >= dark_frac * n_dark)
     if not acc.any():
         return None
     out = np.zeros((H, W), bool)
@@ -98,13 +110,15 @@ def _grab(src, t, W, H):
     return np.frombuffer(r.stdout, np.uint8).reshape(H, W, 3)
 
 
-def detect(src, W, H, duration, samples=150, tol=14, consistency=0.85, min_area=20, grow=9, near_small=True):
+def detect(src, W, H, duration, samples=150, tol=14, consistency=0.85, min_area=20, grow=15, near_small=True):
     """-> HxW bool mask of the watermark(s) found in the four corners, or None.
 
     Real footage changes from frame to frame while an overlaid logo does not. Frames are sampled across
     the whole video; a pixel belongs to the watermark if it is within `tol` of its median colour in at
     least `consistency` of the samples and sits on an edge of the median image (which excludes flat
-    black bars). `grow` is the dilation kernel size covering the anti-aliased outline."""
+    black bars). `grow` is the dilation kernel size covering the anti-aliased outline; 15 (7 px) rather than
+    9 because parts of a logo can show only now and then (the test film's green tick lit up in 4 of 136 dark samples,
+    reaching 2-3 px past a 4 px margin) and no 'what stays the same' test can find them."""
     cw, ch = min(W // 3, 480), min(H // 4, 200)
     corners = [(0, 0), (W - cw, 0), (0, H - ch), (W - cw, H - ch)]  # top-left, top-right, bottom-left, bottom-right
     times = np.linspace(duration * 0.03, duration * 0.97, samples)
