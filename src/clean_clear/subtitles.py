@@ -158,8 +158,9 @@ def _x_overlap(a, b):
     return min(ax1, bx1) - max(ax0, bx0) > 0.4 * min(ax1 - ax0, bx1 - bx0)
 
 
-def build_segments(per_frame, max_gap, min_len):
-    """per_frame: [(text, boxes)] -> [Seg]"""
+def build_segments(per_frame, max_gap, min_len, keep_edges=False):
+    """per_frame: [(text, boxes)] -> [Seg]. keep_edges: also keep short segments that touch the first or last frame
+    (a subtitle cut in two where a long video was split for --jobs is not noise)"""
     # 1) Consecutive frames with identical text (ignoring spaces) -> runs
     runs = []
     for i, (text, boxes) in enumerate(per_frame):
@@ -187,16 +188,18 @@ def build_segments(per_frame, max_gap, min_len):
                 p.boxes += r.boxes
                 continue
         segs.append(r)
-    return [s for s in segs if s.end - s.start + 1 >= min_len]
+    last = len(per_frame) - 1
+    return [s for s in segs if s.end - s.start + 1 >= min_len
+            or (keep_edges and (s.start <= max_gap or s.end >= last - max_gap))]
 
 
-def segments_from_ocr(per_frame, fps, max_gap=5, min_dur=0.4, line="auto"):
+def segments_from_ocr(per_frame, fps, max_gap=5, min_dur=0.4, line="auto", keep_edges=False):
     """Raw per-frame OCR boxes -> (subtitle line, [Seg]). `line` = a known (y centre, height) to reuse
     instead of detecting it, e.g. when checking an already cleaned video where almost no text is left"""
     if line == "auto":
         line = subtitle_line(per_frame)
     texts = [join_text(filter_line(list(b), line)) for b in per_frame]
-    return line, build_segments(texts, max_gap=max_gap, min_len=max(2, round(min_dur * fps)))
+    return line, build_segments(texts, max_gap=max_gap, min_len=max(2, round(min_dur * fps)), keep_edges=keep_edges)
 
 
 def ts(sec):

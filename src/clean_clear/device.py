@@ -32,3 +32,14 @@ def gpu_compute_capability():
         return 0.0
     caps = [float(l) for l in out.split() if re.fullmatch(r"\d+\.\d+", l)]
     return max(caps, default=0.0)
+
+
+def gpu_memory_gb():
+    """Memory of the smallest NVIDIA GPU in GB from nvidia-smi, 0.0 if unknown"""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=15).stdout
+    except Exception:
+        return 0.0
+    mem = [float(l) for l in out.split() if re.fullmatch(r"\d+(\.\d+)?", l)]
+    return min(mem) / 1024 if mem else 0.0

@@ -1,4 +1,5 @@
 """Per-video pipeline: OCR -> SRT -> masks -> [watermark] -> erase (LaMa or ProPainter) -> encode."""
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -12,7 +13,38 @@ from .subtitles import frame_boxes, segments_from_ocr, write_srt
 from . import watermark
 from .rewrite import rewrite
 from .stabilize import stabilize
-from .video import ThreadedWriter, detect_cuts, open_writer, prefetch, probe, read_frames
+from .video import ThreadedWriter, detect_cuts, duration_check, open_writer, prefetch, probe, read_frames
+
+
+def fingerprint(src):
+    """Short id of the source file's identity (size, mtime): a replaced file never reuses an old cache"""
+    st = Path(src).stat()
+    return hashlib.sha1(f"{st.st_size}:{st.st_mtime_ns}".encode()).hexdigest()[:10]
+
+
+def ocr_cache_path(out_dir, src, band, args):
+    """OCR results depend on the file and on the options applied while recognising, so all of them are in the key"""
+    opts = f"{args.min_score}:{args.min_height}:{args.ocr_interval}"
+    key = hashlib.sha1(f"{fingerprint(src)}:{opts}".encode()).hexdigest()[:10]
+    return Path(out_dir) / ".cache" / f"{Path(src).stem}.{band[0]}-{band[1]}.{key}.ocr.json"
+
+
+def watermark_cache_path(out_dir, src):
+    return Path(out_dir) / ".cache" / f"{Path(src).stem}.{fingerprint(src)}.watermark.png"
+
+
+def output_paths(src, out_dir):
+    """-> (clean video, srt, temporary video). The video is written under the temporary name (skipped as input) and
+    renamed only when it is complete, so a `_clean.mp4` is never a half-written file."""
+    src, out_dir = Path(src), Path(out_dir)
+    dst = out_dir / (src.stem + "_clean.mp4")
+    return dst, out_dir / (src.stem + ".srt"), out_dir / f".{src.stem}_clean.tmp.mp4"
+
+
+def all_frames(n):
+    """Frame map for a mask that applies to every frame. `n` is approximate (ffprobe), so it reaches well past it;
+    the backends tolerate entries beyond the real end of the video."""
+    return dict.fromkeys(range(n + max(250, n // 50)), 0)
 
 
 def parse_band(s, H):
@@ -61,7 +93,7 @@ def watermark_mask(src, out_dir, W, H, fps, n, args):
         if img is None or img.shape != (H, W):
             raise ValueError(f"--watermark mask must be a {W}x{H} image (white = watermark): {args.watermark}")
         return img > 127
-    cache = out_dir / ".cache" / f"{src.stem}.watermark.png"  # cached like OCR; an all-black image means none found
+    cache = watermark_cache_path(out_dir, src)  # cached like OCR; an all-black image means none found
     if cache.exists() and not args.no_cache:
         m = cv2.imread(str(cache), cv2.IMREAD_GRAYSCALE) > 127
         log(f"  using watermark cache {cache}")
@@ -89,7 +121,8 @@ def verify_and_fix(src, dst, W, H, fps, n, band, line, cuts, args, ocr, backend,
     if line is None:
         return
     per_frame = run_ocr(dst, W, H, n, band, ocr, args, label="verify")
-    _, segs = segments_from_ocr(per_frame, fps, max_gap=args.max_gap, min_dur=args.min_dur * 0.5, line=line)
+    _, segs = segments_from_ocr(per_frame, fps, max_gap=args.max_gap, min_dur=args.min_dur * 0.5, line=line,
+                                keep_edges=getattr(args, "split_part", False))
     if not segs:
         log("  verify: no subtitle left in the result")
         return
@@ -101,7 +134,7 @@ def verify_and_fix(src, dst, W, H, fps, n, band, line, cuts, args, ocr, backend,
     else:
         masks = box_masks(segs, H, W, args.dilate)
     frame_seg, masks = frame_masks(segs, masks, args.pad_frames)
-    tmp = dst.with_name(dst.stem + ".fix.mp4")
+    tmp = dst.with_name("." + dst.stem.lstrip(".") + ".fix.mp4")
 
     def fix(frames, a, b):  # one keyframe-aligned window; indices relative to its first frame
         fs = {i - a: k for i, k in frame_seg.items() if a <= i < b}
@@ -133,7 +166,7 @@ def process(src, out_dir, args, ocr, backend, encoder):
 
     # Pass 1: OCR (raw results are cached as JSON so reruns skip recognition)
     t0 = time.time()
-    cache = out_dir / ".cache" / f"{src.stem}.{band[0]}-{band[1]}.ocr.json"
+    cache = ocr_cache_path(out_dir, src, band, args)
     if cache.exists() and not args.no_cache:
         per_frame = json.loads(cache.read_text(encoding="utf-8"))
         log(f"  using OCR cache {cache}")
@@ -141,10 +174,12 @@ def process(src, out_dir, args, ocr, backend, encoder):
         per_frame = run_ocr(src, W, H, n, band, ocr, args)
         cache.parent.mkdir(exist_ok=True)
         cache.write_text(json.dumps(per_frame, ensure_ascii=False), encoding="utf-8")
-    line, segs = segments_from_ocr(per_frame, fps, max_gap=args.max_gap, min_dur=args.min_dur)
+    # a part of a --jobs split: a subtitle cut by the split is short here but not noise, keep it at the edges
+    line, segs = segments_from_ocr(per_frame, fps, max_gap=args.max_gap, min_dur=args.min_dur,
+                                   keep_edges=getattr(args, "split_part", False))
     if line:
         log(f"  subtitle line y~{line[0]:.0f}, text height ~{line[1]:.0f}px")
-    srt = out_dir / (src.stem + ".srt")
+    dst, srt, tmp = output_paths(src, out_dir)
     write_srt(segs, fps, srt)
     log(f"  {len(segs)} subtitles -> {srt}  ({time.time() - t0:.0f}s)")
     if backend is None:
@@ -168,12 +203,29 @@ def process(src, out_dir, args, ocr, backend, encoder):
 
     wm = watermark_mask(src, out_dir, W, H, fps, n, args)
 
-    # Pass 2: erase + encode
+    # Pass 2: erase + encode, into a temporary file that becomes `dst` only when complete
     t0 = time.time()
-    dst = out_dir / (src.stem + "_clean.mp4")
+    try:
+        _erase_and_encode(src, tmp, W, H, fps, n, frame_seg, masks, cuts, wm, args, backend, encoder)
+        log(f"  video -> {dst}  ({time.time() - t0:.0f}s, {backend.name})")
+        if args.verify == "on":
+            t0 = time.time()
+            verify_and_fix(src, tmp, W, H, fps, n, band, line, cuts, args, ocr, backend, encoder)
+            log(f"  verify done ({time.time() - t0:.0f}s)")
+        warn = duration_check(src, tmp)
+        if warn:
+            log(f"  WARNING: {warn}")
+        tmp.replace(dst)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _erase_and_encode(src, dst, W, H, fps, n, frame_seg, masks, cuts, wm, args, backend, encoder):
     wr = open_writer(src, dst, W, H, fps, encoder, args.crf)
     tw = ThreadedWriter(wr)  # encoding overlaps with the next frame's inference
     written = 0
+    stream = None
     # relative cost per frame for the ETA (A10 measurements, ms): pass-through ~7, watermark ~39, subtitle frame ~147
     cost = np.full(n + 1, 7.0 + (39.0 if wm is not None else 0.0))
     cost[[i for i in frame_seg if i <= n]] += 147.0
@@ -181,12 +233,13 @@ def process(src, out_dir, args, ocr, backend, encoder):
     try:
         # decoding (ffmpeg) overlaps with inference in the main thread instead of alternating with it
         stream = prefetch(read_frames(src, W, H))
+        wm_frames = all_frames(n)
         if wm is not None:  # watermark: the same erase() on every frame; chained lazily, so still one decode + one encode
             log("  erasing watermark on every frame")
-            stream = backend.erase(stream, {i: 0 for i in range(n + 50)}, {0: wm}, cuts)
+            stream = backend.erase(stream, wm_frames, {0: wm}, cuts)
             if args.wm_guard > 0:
                 stream = watermark.guard_fill(stream, wm, args.wm_guard)
-            stream = stabilize(stream, {i: 0 for i in range(n + 50)}, {0: wm}, cuts, args.stabilize, label="watermark")
+            stream = stabilize(stream, wm_frames, {0: wm}, cuts, args.stabilize, label="watermark")
         stream = stabilize(backend.erase(stream, frame_seg, masks, cuts), frame_seg, masks, cuts, args.stabilize,
                            label="subtitles")
         for frame in stream:
@@ -194,12 +247,11 @@ def process(src, out_dir, args, ocr, backend, encoder):
             written += 1
             prog.update(written)
     finally:
+        if stream is not None:
+            stream.close()  # stops the decoder thread and ffmpeg if we got here through an error
         tw.close()
     if wr.returncode != 0:
         raise RuntimeError(f"ffmpeg encoding failed (code {wr.returncode})")
-    log(f"  video -> {dst}  ({time.time() - t0:.0f}s, {backend.name})")
-
-    if args.verify == "on":
-        t0 = time.time()
-        verify_and_fix(src, dst, W, H, fps, n, band, line, cuts, args, ocr, backend, encoder)
-        log(f"  verify done ({time.time() - t0:.0f}s)")
+    if wm is not None and written > len(wm_frames):
+        raise RuntimeError(f"video has {written} frames, far more than the {n} ffprobe reported; "
+                           "the watermark was not erased on the last ones")

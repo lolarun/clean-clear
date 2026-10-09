@@ -74,7 +74,7 @@ cd /data/videos
 clean-clear /data/videos -o /data/output
 ```
 
-`python -m clean_clear` is equivalent. Output files of earlier runs (`*_clean.mp4`) are skipped, so reruns in the same folder are safe.
+`python -m clean_clear` is equivalent. Output files of earlier runs (`*_clean.mp4`, `*_refined.mp4`) and temporary files are never taken as input, so reruns in the same folder are safe. A video whose `name_clean.mp4` and `name.srt` already exist is skipped, so an interrupted batch continues where it stopped (`--force` processes it again). The video is written to a hidden temporary file and renamed only when it is complete, so a `_clean.mp4` is never half-written. Two inputs with the same name but different extensions (`a.mp4`, `a.mkv`) would write the same output; the second one is reported as failed and must be renamed.
 
 The console prints a progress line every 10 seconds for each stage (`[ocr] 1537/131326 1.2% 51.1 fps elapsed 0:00:30 ETA 0:42:18`), a `[k/N]` header per video, and the same log is appended to `clean-clear.log` in the output directory.
 
@@ -84,7 +84,7 @@ For each video the output directory contains:
 |---|---|
 | `name_clean.mp4` | video with subtitles (and the watermark) removed |
 | `name.srt` | extracted subtitles (UTF-8) |
-| `.cache/` | OCR and watermark-mask cache. Reprocessing the same video skips OCR, so tuning erase settings is fast; use `--no-cache` to force it again |
+| `.cache/` | OCR and watermark-mask cache. Reprocessing the same video skips OCR, so tuning erase settings is fast; use `--no-cache` to force it again. The cache is tied to the file (size and modification time) and to `--min-score`, `--min-height` and `--ocr-interval`, so changing those options or replacing the video runs OCR again |
 | `clean-clear.log` | log of all runs, with timestamps |
 
 ### Common options
@@ -119,8 +119,9 @@ For each video the output directory contains:
 | `--verify` | `on` | after erasing, OCR the result again and erase any subtitle that is still readable (adds one cheap OCR pass; a second decode/encode only if something is found) |
 | `--wm-guard` | `25` | repair a watermark fill whose mean brightness differs from its surroundings by more than this many grey levels (dark-scene flashes); `0` = off |
 | `--stabilize` | `0.6` | blend every inpainted area with the previous frame by up to this weight where its surroundings are static; reduces the frame-to-frame shimmer of the fill that shows at 2x playback. `0` = off |
-| `--jobs` | `1` | process a long video in this many concurrent processes (split into 2x this many parts at keyframes, merged afterwards; OCR runs in parallel too). On one L20 with 4 processes the GPU was saturated and the whole film took 2 h instead of 3 h+. See [Parallel runs and NVIDIA MPS](#parallel-runs-and-nvidia-mps) |
+| `--jobs` | `1` | process a long video in this many concurrent processes (split into 2x this many parts at keyframes, merged afterwards; OCR runs in parallel too). On one L20 with 4 processes the GPU was saturated and the whole film took 2 h instead of 3 h+. Each process loads its own models: with ProPainter that is ~13 GB of GPU memory at `--pp-chunk 120`, so `--jobs 4` needs a ~48 GB GPU (a warning is logged when it will not fit). See [Parallel runs and NVIDIA MPS](#parallel-runs-and-nvidia-mps) |
 | `--keep-parts` | | with `--jobs`, keep the per-part work directory |
+| `--force` | | process videos again even if their `_clean.mp4` and `.srt` already exist |
 | `--refine-of ORIGINAL` | | INPUT is an already cleaned video of ORIGINAL: erase any subtitle still readable in it and fill logo pixels the first pass missed, in one decode and one encode (writes `NAME_refined.mp4`). About 30 min for a 90-minute film, instead of a full rerun |
 | `--min-height` | `0.015` | minimum text height as a fraction of frame height |
 
@@ -136,7 +137,7 @@ For each video the output directory contains:
 
    In both cases only pixels inside the mask are replaced
 6. **Watermark** (`--watermark`, on by default): a static logo is found by sampling frames across the video, and the same erase step runs on it for every frame (before the subtitle step, chained on the same frame stream, so the video is still decoded and encoded once)
-7. **Encoding**: ffmpeg encodes the video and copies the original audio
+7. **Encoding**: ffmpeg encodes the video and copies the original audio. Colours are converted with the source's own matrix (BT.709 / BT.601, as tagged; untagged videos from 720 lines up are treated as BT.709) and the output is tagged accordingly. A variable-frame-rate source is resampled to its average frame rate so that video, audio and subtitles stay in sync; a warning is logged if the output video is not as long as the source
 
 ## Performance
 
@@ -213,6 +214,15 @@ clean-clear /data/videos -o /data/output --propainter-dir /opt/ProPainter
 | `--pp-margin` | `80` | horizontal margin (px) kept around the subtitle when cropping columns; only this cropped region is processed instead of the full frame width |
 
 The OCR cache is shared between models, so you can switch between `lama` and `propainter` on the same output directory without running OCR again.
+
+## Tests
+
+```bash
+.venv/bin/python -m pip install -e ".[test]"
+.venv/bin/python -m pytest
+```
+
+The tests need `ffmpeg` but no GPU and no models: they encode small synthetic videos and use fake OCR and inpainting models to check decoding/encoding (colours, frame counts, variable frame rate, encoder failures), masks, segmentation, caching, the backends' streaming logic, `--jobs` merging and the full `process()` flow.
 
 ## Project layout
 
