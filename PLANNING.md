@@ -135,6 +135,8 @@ Sources: [ProPainter](https://github.com/sczhou/ProPainter), [DiffuEraser](https
 - **Subtitle transitions**: all back-to-back subtitle changes (14 in the test clip), since they were the source of a residual-text bug.
 - **Residual text**: run OCR (`--srt-only --ocr-interval 1`) on the output; any subtitle found is a miss.
 - **Speed and VRAM**: total time and peak VRAM on the A10; VRAM must stay within 8 GB with a reduced `--pp-chunk` for RTX 3050 cards.
+- **Automated tests**: `pytest` (README §Tests) before every delivery; it checks decoding/encoding (colours, frame counts, variable frame rate), masks, segmentation, caching, `--jobs` merging and the backends' streaming logic with fake models. It does not judge inpainting quality, which still needs the check points above.
+- **Duration and colour**: compare output and source duration (logged as a warning when they differ) and spot-check colours on a saturated scene; outputs before 0.3.4 shifted colours on BT.709-tagged sources.
 
 ## Risks and constraints
 

@@ -74,7 +74,7 @@ The process exit code is `0` if every file succeeded and `1` if at least one fai
 | FR-4 | Subtitles shorter than `--min-dur` (default 0.4 s) are treated as noise. |
 | FR-5 | Two-line subtitles are supported and joined with a line break. |
 | FR-6 | The SRT is written even in `--srt-only` mode, without loading any inpainting model. |
-| FR-7 | Reruns on the same video and band reuse the OCR cache; `--no-cache` forces recognition again. |
+| FR-7 | Reruns on the same video and band reuse the OCR cache; `--no-cache` forces recognition again. The cache is invalidated when the file changes (size or modification time) or when `--min-score`, `--min-height` or `--ocr-interval` change. |
 
 ### 5.2 Subtitle erasing
 
@@ -84,7 +84,7 @@ The process exit code is `0` if every file succeeded and `1` if at least one fai
 | FR-9 | By default only the **glyph strokes** (plus outline and a shadow offset) are erased (`--mask glyph`); the rest of the frame keeps its original pixels. `--mask box` erases whole text boxes. Subtitles without white text fall back to boxes. |
 | FR-10 | Frames before and after each subtitle (`--pad-frames`, default 1) are erased too, to cover fade in/out. Back-to-back subtitles get the union of both masks on shared frames. |
 | FR-11 | Pixels outside the mask are never changed. |
-| FR-12 | The output has the same resolution, frame rate and frame count as the input. |
+| FR-12 | The output has the same resolution, frame rate and frame count as the input. A variable-frame-rate input is converted to a constant rate (its average), so the output keeps the input's duration and stays in sync with the audio; a warning is logged if the output video's duration differs from the source's by more than 0.5 s. |
 | FR-13 | With ProPainter, inpainting never mixes frames from different shots (shot-cut aware). |
 
 ### 5.3 Watermark removal
@@ -102,6 +102,8 @@ The process exit code is `0` if every file succeeded and `1` if at least one fai
 |---|---|
 | FR-18 | NVENC H.264 is used when available, otherwise libx264 (`--encoder` overrides). Quality is set with `--crf` (default 18). |
 | FR-19 | The audio stream is copied without re-encoding; video is `yuv420p` with `faststart`. |
+| FR-20 | Colours are preserved: video is converted with the source's own YUV matrix and range (BT.709 / BT.601 as tagged; untagged video BT.709 from 720 lines, BT.601 below) and the output is tagged accordingly. |
+| FR-21 | A `_clean.mp4` is either complete or absent: it is written under a temporary name and renamed when finished. A video whose `_clean.mp4` and `.srt` already exist is skipped unless `--force` is given, so an interrupted batch can be restarted. |
 
 ## 6. Command-line interface
 
@@ -118,6 +120,7 @@ clean-clear [INPUT ...] [-o OUT] [-m propainter|lama] [options]
 | `--device` | `auto` | `auto`, `cuda`, `dml`, `cpu` for OCR and LaMa (ProPainter uses CUDA if available) |
 | `--srt-only` | off | Extract subtitles only |
 | `--no-cache` | off | Ignore OCR and watermark caches |
+| `--force` | off | Process videos again even if their `_clean.mp4` and `.srt` already exist |
 | `--watermark` | `auto` | `auto`, `off`, or a mask image path |
 | `--ocr-fixed-shape` | `auto` | Feed OCR recognition a fixed input shape (workaround for multi-second stalls per new shape seen on an RTX 5090); `auto` = on for compute capability 12+ |
 | `--ocr-interval` | `10` | Max frames to skip OCR while the band is unchanged (`1` = every frame) |
@@ -132,6 +135,14 @@ clean-clear [INPUT ...] [-o OUT] [-m propainter|lama] [options]
 | `--pp-raft-iter` | `12` | Optical-flow iterations (lower = faster, less accurate) |
 | `--pp-ctx`, `--pp-pad` | `10`, `8` | Context frames per chunk side, extra frames around subtitle runs |
 | `--pp-margin` | `80` | Horizontal margin (px) around the subtitle when cropping |
+| `--pp-ref-stride` | `10` | Interval between ProPainter's global reference frames |
+| `--extend-sec` | `3` | Keep erasing up to this long before/after a subtitle while its glyphs are still visible (`0` = off) |
+| `--verify` | `on` | OCR the result again and erase any subtitle still readable |
+| `--wm-guard` | `25` | Repair watermark fills brighter than their dark surroundings by more than this (`0` = off) |
+| `--stabilize` | `0.6` | Blend filled areas with the motion-compensated previous frame against shimmer (`0` = off) |
+| `--jobs` | `1` | Split a long video into 2× this many parts and process them in this many processes; each needs its own GPU memory (~13 GB with ProPainter at chunk 120, a warning is logged if they will not fit) |
+| `--keep-parts` | off | With `--jobs`, keep the per-part work directory |
+| `--refine-of ORIGINAL` | | Post-fix an already cleaned INPUT of ORIGINAL (residual subtitles, missed logo pixels), writing `NAME_refined.mp4` |
 
 `scripts/install.bat` / `scripts/install.sh` create the virtual environment and install the package in editable mode, which provides the `clean-clear` command (`python -m clean_clear` is equivalent).
 
@@ -194,12 +205,13 @@ Running two processes on the 5090 and splitting the batch across the customer's 
 
 ## 11. Acceptance criteria
 
-1. For each input video a `_clean.mp4` and an `.srt` are produced; resolution, frame rate, frame count and audio are unchanged.
+1. For each input video a `_clean.mp4` and an `.srt` are produced; resolution, frame rate, frame count, duration, colours and audio are unchanged (variable-frame-rate inputs: constant average rate, same duration).
 2. At a set of spot-checked timestamps (static dialogue shots, moving shots, back-to-back subtitles, shot cuts) no subtitle remnants, dark blobs or flicker are visible at normal playback speed.
 3. Running OCR on the output (`--srt-only --ocr-interval 1`) finds no subtitles (residual-text check).
 4. With `--watermark auto`, the logo is invisible in the output and the frame content around it is unchanged.
 5. Subtitle text and timing in the SRT match what is shown in the source video, apart from occasional OCR character errors.
-6. A batch with a corrupt or unsupported file completes for the other files and returns a non-zero exit code.
+6. A batch with a corrupt or unsupported file completes for the other files and returns a non-zero exit code; no partial `_clean.mp4` is left behind, and a rerun skips the finished videos.
+7. `pytest` passes (see README §Tests).
 
 ## 12. Change history (functional)
 

@@ -231,13 +231,18 @@ src/clean_clear/
   cli.py             command-line options, batch loop
   pipeline.py        per-video flow: OCR -> SRT -> masks -> watermark -> erase -> encode
   subtitles.py       OCR, subtitle-line detection, segmentation, SRT
-  masks.py           glyph / box masks
+  masks.py           glyph / box masks (stored as crops, MaskSet)
   watermark.py       static watermark detection
-  video.py           ffmpeg decoding and encoding, cut detection
-  device.py          ONNX Runtime device selection, GPU capability
+  stabilize.py       temporal smoothing of filled areas
+  rewrite.py         re-encode only the changed windows of a finished video
+  refine.py          --refine-of
+  parallel.py        --jobs: split, run parts, merge
+  video.py           ffmpeg decoding and encoding (colour, variable frame rate), cut detection
+  device.py          ONNX Runtime device selection, GPU capability and memory
   common.py          version, paths, logging, progress
   backends/lama.py        LaMa backend (ONNX Runtime)
   backends/propainter.py  ProPainter backend (PyTorch)
+tests/               pytest suite (needs ffmpeg, no GPU)
 scripts/             install.sh, install.bat
 docs/spec/           functional and technical design
 pyproject.toml       dependencies and the clean-clear command

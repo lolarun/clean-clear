@@ -30,19 +30,26 @@ Design principles:
 src/clean_clear/                    the package (src layout, installed with `pip install -e .`)
   __main__.py                       `python -m clean_clear`
   cli.py                            argument parsing, input discovery, model/encoder setup, per-file loop with error isolation
-  pipeline.py                       per-video orchestration (both passes), OCR loop, watermark mask resolution
+  pipeline.py                       per-video orchestration (both passes, verify), OCR loop, watermark mask resolution,
+                                    cache paths, temporary/final output paths
   subtitles.py                      OCR wrapper, subtitle-line detection, segmentation, SRT writer
-  masks.py                          glyph / box masks, per-frame mask assignment
+  masks.py                          MaskSet (crop-based mask storage), glyph / box masks, per-frame mask assignment
+  stabilize.py                      motion-compensated temporal smoothing of filled areas
+  rewrite.py                        re-encode only keyframe windows of a finished video, stream-copy the rest
+  refine.py                         --refine-of: post-fix an already cleaned video
+  parallel.py                       --jobs: split at keyframes, run part processes, merge video and SRT
   watermark.py                      static watermark detection
-  video.py                          ffmpeg wrappers: probe, decode, cut detection, encoder selection, threaded I/O helpers
-  device.py                         ONNX Runtime provider selection, GPU compute capability
+  video.py                          ffmpeg wrappers: probe, colour/VFR handling, decode, cut detection, encoder selection,
+                                    threaded I/O helpers, duration check
+  device.py                         ONNX Runtime provider selection, GPU compute capability and memory
   common.py                         ROOT, version, log(), Progress, usable_cpus()
   backends/__init__.py              backend interface and factory
   backends/lama.py                  LaMa (ONNX Runtime)
   backends/propainter.py            ProPainter (PyTorch)
 scripts/install.sh, install.bat     environment setup
+tests/                              pytest suite (synthetic videos, fake OCR and models; needs ffmpeg, no GPU)
 docs/spec/                          this document and FUNCTIONAL.md
-pyproject.toml                      dependencies (extra `propainter`), version, the `clean-clear` console script
+pyproject.toml                      dependencies (extras `propainter`, `test`), version, the `clean-clear` console script
 ```
 
 `ROOT` (repository root, three levels above `common.py` in a source checkout or editable install) is where `models/`, an optional `ffmpeg/` folder and the default `ProPainter/` checkout are looked up. A non-editable install would not find them, which is why the install scripts use `pip install -e .`.
@@ -64,7 +71,7 @@ Models are never committed to git; the README lists every download URL.
 
 ### 4.1 Probe and setup (`pipeline.process`)
 
-`video.probe` runs `ffprobe` and returns `(W, H, fps, n_frames)`. The frame count comes from `nb_frames`, falling back to `duration × fps`; it is therefore **approximate** and the code never relies on it being exact (see §5.5). `parse_band` converts `--band` into even-aligned pixel rows `(y0, y1)`.
+`video.probe` runs `ffprobe` and returns `(W, H, fps, n_frames)`. `fps` is the average frame rate. The frame count comes from `nb_frames`, falling back to `duration × fps`; it is therefore **approximate** and the code never relies on it being exact (see §5.5). A source whose average and nominal rates differ by more than 0.5% is treated as variable frame rate: `n = duration × fps`, and every decoder (`read_frames`, `detect_cuts`) resamples it to `fps` so that all passes share one frame numbering (§4.8a). `video.colour` returns the YUV matrix, range and output colour tags used by `read_frames` and `open_writer`. `parse_band` converts `--band` into even-aligned pixel rows `(y0, y1)`.
 
 ### 4.2 Pass 1 — OCR (`pipeline.run_ocr`)
 
@@ -204,7 +211,7 @@ Peak VRAM: about 13 GB at chunk 120 on the 1080p test clip; 7.0 / 15.6 / 20.3 GB
 | `per_frame` | `[[ (x0,y0,x1,y1,text) ]]` | one entry per frame, full-frame coordinates, JSON-cacheable |
 | `Seg` | `start, end, texts: Counter, boxes` | inclusive frame range |
 | `frame_seg` | `{int: key}` | key is an `int` (watermark) or a tuple of segment indices |
-| `masks` | `{key: H×W bool}` | full-frame arrays, shared between equal keys; treated as read-only |
+| `masks` | `MaskSet` `{key: H×W bool}` (or a plain dict for the watermark) | stored as crops; indexing returns a read-only full-frame array, the same object while it stays in the 16-entry cache |
 | `cuts` | sorted `[int]` | first frame of each new shot |
 | chunk | `(s, e, cs, ce)` | output range `s..e`, input range `cs..ce`, inclusive |
 
@@ -293,7 +300,9 @@ Suggested regression checks: the fixed timestamps listed in PLANNING.md §Valida
 ## 10. Known risks and open issues
 
 - **ProPainter licence** is non-commercial; the LaMa backend is the licence-clean fallback.
-- **Approximate frame count** from ffprobe; any new code must not assume an exact `n`.
+- **Approximate frame count** from ffprobe; any new code must not assume an exact `n`. Maps that must cover every frame use `pipeline.all_frames(n)`.
+- **Outputs of 0.3.3 and earlier** are untagged and were encoded with BT.601; a partial re-encode of such a file (`--refine-of` windows) can show a slight colour difference between rewritten windows and copied pieces. Reprocess from the original if this matters.
+- **`--jobs` part boundaries:** parts are stream-copy cuts at keyframes; ProPainter context and stabilization restart at each boundary, and a subtitle across a boundary is processed as two halves (joined again in the SRT).
 - **Whole-frame copies:** the watermark stage copies every frame it buffers, and the subtitle stage copies frames it edits; at 1080p this is a few MB per frame and is small next to inference, but it adds up on very fast GPUs.
 - **Chunk seams:** neighbouring chunks are solved independently (PLANNING Q5, cross-fade not implemented).
 - **Very short shots** (≥ 1 frame) get the duplicate-frame fallback and little context.
@@ -307,4 +316,5 @@ Suggested regression checks: the fixed timestamps listed in PLANNING.md §Valida
 - **Second watermark or moving logo:** call `erase` again in `pipeline.process` with another mask (per-frame masks are already supported by `frame_seg`).
 - **Different OCR engine:** replace `subtitles.OCR`; the rest only needs `[(box, text, score)]` per frame.
 - **Per-video parameters:** `pipeline.process(src, out_dir, args, ...)` reads everything from `args`, so a config-file layer can be added in `cli.py`.
-- **Parallel processing:** run several `clean-clear` processes on disjoint folders, or several per GPU for small-crop workloads; there is no shared state except the output directory.
+- **Parallel processing:** `--jobs` for one long video, or several `clean-clear` processes on disjoint folders. Processes writing to the same output directory share `.cache/` (keys include the file fingerprint, so they do not collide) and the skip-if-finished check.
+- **Tests:** add a pytest under `tests/`; `conftest.py` has helpers for synthetic videos, and `tests/test_pipeline.py` shows how to drive `process()` with a fake OCR and backend.
