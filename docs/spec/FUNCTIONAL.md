@@ -47,16 +47,18 @@ It was built for a customer job: batch-process long videos on their own Windows 
 
 ### Input
 
-`clean-clear [<path> ...] [-o OUT]`, where each path is a video file or a directory; without arguments the current directory is processed and the results are written to the current directory. Directories are scanned (non-recursively) for `.mp4 .mkv .mov .avi .flv .ts .m4v .wmv .webm`, sorted by name. Files whose name ends in `_clean` (results of earlier runs) are skipped, so input and output may be the same folder. Missing paths are skipped with a log line.
+`clean-clear [<path> ...] [-o OUT]`, where each path is a video file or a directory; without arguments the current directory is processed and the results are written to the current directory. Directories are scanned (non-recursively) for `.mp4 .mkv .mov .avi .flv .ts .m4v .wmv .webm`, sorted by name. Our own results (`*_clean`, `*_refined`) and temporary files (hidden files, `*.tmp`, `*.fix`) are skipped, so input and output may be the same folder. Missing paths are skipped with a log line. Inputs that differ only in extension (`a.mp4`, `a.mkv`) would overwrite each other's results: the second one is reported as failed.
 
-### Output (in `OUT`, default `./output`)
+A video whose `<name>_clean.mp4` and `<name>.srt` already exist is skipped (`--force` reprocesses it), so a long batch can be restarted after an interruption. The video is written under a temporary name and renamed when complete.
+
+### Output (in `OUT`, default: the current directory)
 
 | File | Description |
 |---|---|
 | `<name>_clean.mp4` | H.264 video, subtitles (and optionally the watermark) removed, original audio copied |
 | `<name>.srt` | UTF-8 SRT, one entry per recognized subtitle sentence |
-| `.cache/<name>.<y0>-<y1>.ocr.json` | Raw OCR results for the subtitle band (reused on reruns) |
-| `.cache/<name>.watermark.png` | Detected watermark mask (white = watermark); all black = none found. Also useful for visual inspection |
+| `.cache/<name>.<y0>-<y1>.<key>.ocr.json` | OCR results for the subtitle band (reused on reruns; the key covers the file's size and modification time and the OCR options) |
+| `.cache/<name>.<file key>.watermark.png` | Detected watermark mask (white = watermark); all black = none found. Also useful for visual inspection |
 
 The process exit code is `0` if every file succeeded and `1` if at least one failed. A failure in one file is logged (`!! failed <file>: <reason>`) and does not stop the batch.
 
@@ -210,3 +212,4 @@ Running two processes on the 5090 and splitting the batch across the customer's 
 | Optional watermark removal | Customer request |
 | Defaults: ProPainter, watermark `auto`, current directory in and out | One command in the video folder |
 | Renamed to Clean Clear | Owner's decision |
+| Skip finished videos, atomic output, cache keyed by file and options, colour-exact and VFR-safe encoding (v0.3.4) | Review findings: batch restarts, stale caches, colour shift on BT.709 sources, audio drift on variable-frame-rate sources |

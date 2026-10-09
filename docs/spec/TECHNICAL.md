@@ -72,7 +72,7 @@ Models are never committed to git; the README lists every download URL.
 - **OCR skipping.** For each frame a cheap signature is computed: the boolean map of bright, low-saturation pixels (`min > 170 and max − min < 50`) on the half-resolution band. If fewer than `max(30, 8% of reference white pixels)` pixels differ from the last OCR'd frame and fewer than `--ocr-interval` frames have passed, the previous result is reused. On the test videos OCR ran on 24–36% of frames.
 - **Recognition.** RapidOCR with `Det.limit_type=max`, `Det.limit_side_len=960` (an earlier `min` setting upscaled the band and was very slow), on the ONNX CUDA provider.
 - **First-pass filter** (`subtitles.frame_boxes`): drop boxes with score below `--min-score`, height below `max(8, H × --min-height)`, or a centre outside 15–85% of the frame width. Boxes are converted to full-frame coordinates.
-- Raw per-frame boxes are cached as JSON, keyed by video stem and band.
+- Per-frame boxes are cached as JSON (`pipeline.ocr_cache_path`), keyed by video stem, band, the file's size and modification time, and the options applied during recognition (`--min-score`, `--min-height`, `--ocr-interval`): a replaced file or changed option never reuses a stale result.
 
 ### 4.3 Subtitle-line detection and segmentation (`subtitles.py`)
 
@@ -89,7 +89,7 @@ Models are never committed to git; the README lists every download URL.
 
 - **Glyph mask** (`glyph_masks`, default). One extra decode of the band. For each frame that belongs to a segment, white pixels inside the segment's box rectangle are counted per pixel. Pixels white in **at least 50%** of the segment's frames are strokes. The stroke map is dilated with an ellipse of radius `--grow` (default 8) to cover the outline, OR-ed with a copy shifted `--shadow` px (default 3) down and right for the drop shadow, and intersected with the box dilated by the same kernel. If a segment has too few white pixels (< 3% of its box area) it falls back to the box mask.
 - **Box mask** (`box_masks`): union of a segment's OCR boxes expanded by `--dilate`.
-- **Frame assignment** (`frame_masks`): every frame from `start − pad` to `end + pad` maps to the segment. A frame covered by several segments (back-to-back subtitles) maps to a tuple key and receives the **union** of their masks. Result: `frame_seg: {frame → key}`, `masks: {key → HxW bool}`. Masks are full-frame arrays that are zero outside the band; identical keys share one array.
+- **Frame assignment** (`frame_masks`): every frame from `start − pad` to `end + pad` maps to the segment. A frame covered by several segments (back-to-back subtitles) maps to a tuple key and receives the **union** of their masks. Result: `frame_seg: {frame → key}`, `masks: {key → HxW bool}`. Masks are kept in a `MaskSet`: each mask is stored as the crop around its pixels and the full-frame (read-only) array is built on access, with the 16 most recently used arrays cached so that a backend asking for the same key on consecutive frames gets the same object. Full-frame storage, plus full-band per-pixel counts in `glyph_masks`, took ~7.6 GB per 1,500 subtitles at 1080p; crops take ~0.3 GB.
 
 ### 4.5 Shot-cut detection (`video.detect_cuts`)
 
@@ -103,7 +103,7 @@ Only computed when the backend sets `uses_cuts = True`. The video is decoded as 
 4. Close small gaps (7×7), keep connected components of at least 20 px, dilate by a 9×9 ellipse for anti-aliased edges.
 5. Reject the result if it covers more than 5% of the frame.
 
-The mask is cached as `.cache/<stem>.watermark.png` (an all-black image means "none found" and prevents redetection). `--watermark <png>` bypasses detection.
+The mask is cached as `.cache/<stem>.<file key>.watermark.png` (an all-black image means "none found" and prevents redetection). `--refine-of` reads this cache to know exactly what the first pass erased (falling back to the pre-0.3.4 name, then to a re-detection with the 0.3.2 rules). `--watermark <png>` bypasses detection.
 
 Measured: 13 s per video, independent of video length, IoU 0.99 between detection on the original and on an already-cleaned video.
 
@@ -112,13 +112,13 @@ Measured: 13 s per video, independent of video length, IoU 0.99 between detectio
 ```python
 stream = prefetch(read_frames(src, W, H))                    # decode thread
 if wm is not None:
-    stream = backend.erase(stream, {i: 0 for i in range(n + 50)}, {0: wm}, cuts)   # watermark on every frame
+    stream = backend.erase(stream, all_frames(n), {0: wm}, cuts)   # watermark on every frame
 for frame in backend.erase(stream, frame_seg, masks, cuts):  # subtitles
     tw.write(frame.tobytes())                                # encode thread
 ```
 
 - The two `erase` calls are lazy generators, so the video is decoded once and encoded once; the watermark stage buffers at most one chunk, the subtitle stage another.
-- The watermark frame map deliberately covers `n + 50` frames because `n` is approximate; the ProPainter backend tolerates entries beyond the real end of the video.
+- The watermark frame map (`all_frames`) deliberately covers `n + max(250, 2% of n)` frames because `n` is approximate; the backends tolerate entries beyond the real end of the video.
 - **Why the watermark is a separate erase call.** ProPainter processes one rectangle per call. The logo (top-left) and the subtitles (bottom-centre) are far apart, so a single rectangle would span most of the frame height. Two small crops are far cheaper. They also cover different frame sets (all frames vs. ~50%).
 - **Threading (P4).** `video.prefetch` runs the ffmpeg reader in a background thread (bounded queue of 8); `video.ThreadedWriter` writes to the encoder's stdin from another thread (queue of 8) and re-raises worker errors on the next `write`/`close`. GPU inference stays on the main thread. Order is preserved because each side is a single-consumer queue.
 - **Encoding** (`video.open_writer`): raw BGR on stdin, audio copied from the source (`-map 1:a?`, `-c:a copy`), NVENC `p5` VBR with `-cq` (`--crf`) and `-b:v 0` or libx264 `medium`, `yuv420p`, `+faststart`. `pick_encoder("auto")` tests NVENC with a 0.2 s synthetic clip and falls back to libx264.
@@ -139,6 +139,16 @@ A customer spot-check of the first delivery found a subtitle left on screen and 
 **Parallel run (`--jobs N`, `parallel.py`) and post-fix (`--refine-of`, `refine.py`).** `--jobs` splits the video at keyframes into 2N parts, runs N independent Clean Clear processes pinned to disjoint CPU sets (OCR, masks, erase, verify each), takes the watermark mask from one detection on the whole film, and merges the parts (SRT time-shifted, video stream-copied, original audio). On a 16-vCPU L20 four processes reached 100 % GPU utilisation at about 19 frames/s in total (single process 12-13), so more processes do not help; 87.5 min of 720p took 2 h including OCR. `--refine-of` OCRs a finished result with the subtitle line taken from the original, erases what is still readable and fills missed logo pixels, writing one new file.
 
 Not supported by the data and therefore not changed: bridging OCR gaps inside a sentence (0 cases found), larger `--pad-frames`, and lowering `--pp-ref-stride` (no measurable effect on the flicker; it only makes the transformer step slower).
+
+### 4.8a Robustness fixes after code review (v0.3.4)
+
+- **Colours.** `video.colour()` determines the YUV matrix and range of a video (its tags; untagged: BT.709 from 720 lines, BT.601 below). `read_frames` converts with `scale=in_color_matrix=…`, `open_writer` with `out_color_matrix=…` and writes the colour tags. Before, a tagged BT.709 film was decoded as BT.709 but encoded as BT.601 without tags (a test bar moved from YCbCr 84/154/158 to 93/150/156).
+- **Variable frame rate.** `probe` flags a source whose average and nominal rates differ by more than 0.5%; `read_frames` and `detect_cuts` then resample it to the average rate (`-fps_mode cfr`), and the frame count is `duration × fps`. Before, a 6 s VFR clip came out as 9.2 s of video against 6 s of audio. `duration_check` logs a warning when an output's video length differs from the source's by more than 0.5 s.
+- **Encoder failure.** `ThreadedWriter` keeps draining its queue after a write error, so `write()`/`close()` raise instead of blocking forever when ffmpeg exits (seen as a hang with an unknown encoder; NVENC session limits or a full disk do the same).
+- **Early stop.** `prefetch` stops its thread and closes the reader when the consumer stops; `read_frames` kills its ffmpeg if closed early. A failed video no longer leaves a decoder process behind.
+- **Atomic output and restart.** `process` writes `.<name>_clean.tmp.mp4`, runs verify on it and renames it when everything succeeded; on failure it is deleted. The CLI skips videos whose `_clean.mp4` and `.srt` exist (`--force` to redo) and logs a traceback for failures.
+- **`--jobs`.** Part processes get `--split-part`: segments touching a part's first or last frames are kept even if shorter than `--min-dur` (a subtitle cut by the split was dropped and stayed on screen). `parallel.merge_cues` joins the two halves of such a subtitle into one cue. SRT offsets come from the frame counts of the cleaned parts (what the merged video is made of), the merged frame count and duration are checked, and a GPU-memory warning is logged when the processes will not fit.
+- **Watermark frame map** (`pipeline.all_frames`) reaches `n + max(250, 2% of n)`; if the video still has more frames, the run fails instead of silently leaving the logo on the last frames.
 
 ### 4.9 Third customer review (v0.3.3)
 
@@ -251,8 +261,10 @@ The estimate made before the run (about 1.7 h) was scaled from A10 timings with 
 | ffmpeg missing | `sys.exit` with install hint |
 | Device unavailable | `sys.exit` listing available ONNX providers |
 | ProPainter weights or checkout missing | `sys.exit` with the missing path |
-| Exception while processing one video | Logged as `!! failed`, batch continues, exit code 1 |
-| ffmpeg encoder failure / broken pipe | `RuntimeError`; encoder thread errors are re-raised in the main thread |
+| Exception while processing one video | Logged as `!! failed` with a traceback, the temporary output is deleted, batch continues, exit code 1 |
+| ffmpeg encoder failure / broken pipe | `RuntimeError` on the next `write`/`close` (the writer thread keeps draining, so nothing blocks) |
+| Two inputs with the same name, different extension | The second is reported as failed (they would share outputs) |
+| Output video shorter/longer than the source | Warning in the log |
 | Watermark mask of wrong size | `ValueError` with the expected size |
 | Watermark detection finds nothing / > 5% area | Logged, video processed without it |
 | CUDA out of memory | Not caught; lower `--pp-chunk` |
@@ -260,7 +272,7 @@ The estimate made before the run (about 1.7 h) was scaled from A10 timings with 
 
 ## 9. Testing and verification
 
-There is no automated test suite in the repository; verification so far was done as follows.
+`pytest` (see README §Tests) runs on synthetic videos with ffmpeg and fake OCR/inpainting models, no GPU needed: colour round trips (tagged BT.709, untagged HD and SD), grey level, variable frame rate, encoder failure, early stop of readers, frame-exact windows; MaskSet, union masks, glyph masks and glyph-matched extension; segmentation incl. split edges; cache keys; input filtering, name clashes, skipping finished videos; `--jobs` cue merging and child options; refine's first-pass mask; LaMa and ProPainter streaming with fake models (order, frame count, only masked pixels change, chunks never cross a cut); and `process()` end to end (SRT text and timing, subtitle erased, verify pass, failed run leaves no output, OCR cache reused). Earlier verification, still relevant for model quality:
 
 **Offline, with fakes** (no GPU, no models): chunk layout and cut clamping; streaming order and frame count with a fake engine; horizontal crop widths and pasting; chained watermark + subtitle `erase` at 1280×714 with a shot cut, asserting the engine sees dimensions divisible by 8 and that logo and subtitle pixels change only where intended; `prefetch` / `ThreadedWriter` ordering with 2000 items.
 
