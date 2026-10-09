@@ -176,7 +176,7 @@ The customer decision so far is to use **ProPainter** for delivery.
 
 ## 9. Legal and compliance notes
 
-- ProPainter (code and weights) is released under the NTU S-Lab License 1.0 for **non-commercial use only**. The customer must confirm that this is acceptable for their use; otherwise the LaMa backend (Apache-2.0) must be used.
+- ProPainter (code and weights) is released under the NTU S-Lab License 1.0 for **non-commercial use only**. The customer must confirm that this is acceptable for their use; otherwise the LaMa backend (Apache-2.0) must be used. The planned quality improvements that matter most for static shots (clean plate, inpaint-once-and-propagate; TECHNICAL §13) can be built on LaMa as well. Alternative models and their licences are surveyed in TECHNICAL §14.
 - Removing a third-party watermark or subtitles from a video may infringe rights of the content owner. The tool does not check ownership; this is the operator's responsibility.
 - Model and package licences are listed in the README.
 
@@ -206,7 +206,7 @@ Running two processes on the 5090 and splitting the batch across the customer's 
 ## 11. Acceptance criteria
 
 1. For each input video a `_clean.mp4` and an `.srt` are produced; resolution, frame rate, frame count, duration, colours and audio are unchanged (variable-frame-rate inputs: constant average rate, same duration).
-2. At a set of spot-checked timestamps (static dialogue shots, moving shots, back-to-back subtitles, shot cuts) no subtitle remnants, dark blobs or flicker are visible at normal playback speed.
+2. At a set of spot-checked timestamps (static dialogue shots, moving shots, back-to-back subtitles, shot cuts; the fixed check points are listed in TECHNICAL §9) no subtitle remnants, dark blobs or flicker are visible at normal playback speed.
 3. Running OCR on the output (`--srt-only --ocr-interval 1`) finds no subtitles (residual-text check).
 4. With `--watermark auto`, the logo is invisible in the output and the frame content around it is unchanged.
 5. Subtitle text and timing in the SRT match what is shown in the source video, apart from occasional OCR character errors.

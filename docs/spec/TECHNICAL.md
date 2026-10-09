@@ -1,6 +1,6 @@
 # Clean Clear — Technical Design
 
-Version 0.3.x. Companion document: [FUNCTIONAL.md](FUNCTIONAL.md). Defect analyses: [MEMO.md](../../MEMO.md). Roadmap: [PLANNING.md](../../PLANNING.md).
+Version 0.3.x. Companion document: [FUNCTIONAL.md](FUNCTIONAL.md). Defect investigations: §12. Roadmap: §13. Alternative models: §14.
 
 ## 1. Overview
 
@@ -196,7 +196,7 @@ ONNX export `Carve/LaMa-ONNX` (`lama_fp32.onnx`), fixed 512×512 input, output i
 
 **Backend (`ProPainterBackend.erase`)** streams frames and decides *what* the engine sees:
 
-1. **Runs and chunks (`_chunks`).** Frames to erase are grouped into runs (gaps ≤ 10 frames, same shot). Each run is extended by `PAD` frames (default 8) on both sides, clamped to the shot, and split into chunks of `--pp-chunk` frames (default 120). Each chunk is processed with `CTX` (default 10) context frames on each side, also clamped to the shot. **No chunk or context ever crosses a shot cut**: ProPainter assumes one continuous shot and would otherwise propagate pixels from another shot into the hole (root cause of the dark blobs analysed in MEMO.md §1).
+1. **Runs and chunks (`_chunks`).** Frames to erase are grouped into runs (gaps ≤ 10 frames, same shot). Each run is extended by `PAD` frames (default 8) on both sides, clamped to the shot, and split into chunks of `--pp-chunk` frames (default 120). Each chunk is processed with `CTX` (default 10) context frames on each side, also clamped to the shot. **No chunk or context ever crosses a shot cut**: ProPainter assumes one continuous shot and would otherwise propagate pixels from another shot into the hole (root cause of the dark blobs analysed in §12.1).
 2. **Vertical band.** Rows are the vertical extent of all masks ± 40 px, aligned to multiples of 8 and clamped to `H // 8 × 8` (RAFT requires multiples of 8; a 714-px-tall video otherwise fails inside RAFT's correlation lookup). Minimum height 128 px (`MIN_SIDE`) so tiny regions such as a corner logo still get context.
 3. **Horizontal crop per chunk (P1).** Columns are the horizontal extent of the masks used in that chunk ± `--pp-margin` (80 px), rounded to multiples of 8, minimum width 128 px. Bands are cached full-width and cropped fresh for each chunk, so two chunks sharing a frame can use different crops. Frames are edge-padded and masks zero-padded to multiples of 8 if needed. This makes engine work proportional to text width instead of frame width.
 4. **Streaming buffer.** A dictionary holds frames not yet emitted (`buf`) and original bands still needed as chunk input (`bands`). A chunk runs as soon as its last context frame has arrived; frames before the next pending chunk are emitted immediately. If the video ends before the last chunk's context is complete, the remaining chunks run on what exists. `need` is computed up front so only required bands are copied.
@@ -219,7 +219,16 @@ Invariants: output frame `i` equals input frame `i` outside the masks; the numbe
 
 ## 7. Performance model
 
-Measured on an NVIDIA A10 (24 GB), 1280×714, ProPainter, chunk 120:
+Baseline on an NVIDIA A10 (24 GB), 5-minute 1080p test clip (7515 frames, 3785 with subtitles), before the P1–P4 speed-ups:
+
+| Model | OCR | Masks | Erase + encode | Total | Peak VRAM |
+|---|---|---|---|---|---|
+| LaMa | 154 s | 22 s | 341 s | ~8.6 min | ~2 GB |
+| ProPainter (chunk 120) | 154 s | 22 s | ~30–40 min | ~35–45 min | ~13 GB |
+
+ProPainter then processed 4792 frames to erase 3785 (≈ 27 % overhead from chunk context and padding).
+
+Measured on an NVIDIA A10 (24 GB), 1280×714, ProPainter, chunk 120, current code:
 
 | Stage | 87.6 min video | Notes |
 |---|---|---|
@@ -239,7 +248,7 @@ Cost drivers and levers:
 | Resolution | decode/OCR/mask cost ≈ ×1.7–2.4 at 1080p; erase ≈ ×1.9 (estimate) | — |
 | Small crops under-fill the GPU | speed-up on faster GPUs is smaller than for large crops | run 2 processes per GPU |
 
-Implemented optimizations: horizontal crop (P1), fewer RAFT iterations (P2, 20 → 12, **quality not yet validated on a large sample**), tunable context and padding (P3, partial — flow is **not** reused across chunk overlaps), decode/inference/encode threading (P4). Remaining ideas are in PLANNING.md (clean plate for static shots, shot-wide reference frames, half-resolution mode, `torch.compile`).
+Implemented optimizations: horizontal crop (P1), fewer RAFT iterations (P2, 20 → 12, **quality not yet validated on a large sample**), tunable context and padding (P3, partial — flow is **not** reused across chunk overlaps), decode/inference/encode threading (P4). Remaining ideas are in §13 (clean plate for static shots, shot-wide reference frames, half-resolution mode, `torch.compile`).
 
 ### 7.1 Measurement on an RTX 5090 container (2026-09-28)
 
@@ -289,22 +298,31 @@ The estimate made before the run (about 1.7 h) was scaled from A10 timings with 
 |---|---|
 | 5-minute 1080p clip, full pipeline | comparison against the customer's reference output: on par for static shots |
 | Full 87.6-minute 720p film | completes, output 3.1 GB, ≈ 3.3 h |
-| 0:25 dark blobs (MEMO.md §1) | reproduced, root-caused to shot cuts, fixed and verified on a full rerun |
-| 2:56 residual text (MEMO.md §2) | fixed by union masks |
+| 0:25 dark blobs (§12.1) | reproduced, root-caused to shot cuts, fixed and verified on a full rerun |
+| 2:56 residual text (§12.2) | fixed by union masks |
 | Watermark on 5-minute clip | logo removed in five spot checks incl. static dark and textured backgrounds |
 
 **Not yet verified:** RAFT at 12 iterations across the full test set; 1080p timings; RTX 3050 and RTX 5090 runs (VRAM at chunk 60–80, PyTorch build for Blackwell); Windows end-to-end run of the ProPainter path; multi-video batches with mixed resolutions.
 
-Suggested regression checks: the fixed timestamps listed in PLANNING.md §Validation, the residual-text OCR check on the output, and a frame-count/duration comparison between input and output.
+**Regression checks before a delivery:**
+
+- **Fixed check points** of the 5-minute test clip: 0:03, 0:20, 1:53, 2:30, 2:56, 3:20, 4:05, 4:35, compared side by side with the original, the customer's reference output and the previous version. 2:30 (static table) and 1:53 / 4:05 (moving people) are the hardest cases.
+- **Subtitle transitions**: all back-to-back subtitle changes (14 in the test clip), the source of the residual-text bug in §12.2.
+- **Residual text**: run OCR (`--srt-only --ocr-interval 1`) on the output; any subtitle found is a miss.
+- **Duration and colour**: output and source durations match (a mismatch is logged as a warning); spot-check colours on a saturated scene.
+- **Speed and VRAM**: total time and peak VRAM; VRAM must stay within 8 GB with a reduced `--pp-chunk` for RTX 3050 cards.
+- `pytest`, which does not judge inpainting quality.
 
 ## 10. Known risks and open issues
 
-- **ProPainter licence** is non-commercial; the LaMa backend is the licence-clean fallback.
+- **ProPainter licence** is non-commercial; the LaMa backend is the licence-clean fallback (Q2 and Q6 in §13 can also be built on LaMa).
+- **VRAM:** longer reference windows (Q3) and taller bands (Q4) increase GPU memory; the chunk size must be adjusted per GPU.
+- **RTX 50 series** needs a PyTorch build with CUDA 12.8+; ProPainter has not been tested on it.
 - **Approximate frame count** from ffprobe; any new code must not assume an exact `n`. Maps that must cover every frame use `pipeline.all_frames(n)`.
 - **Outputs of 0.3.3 and earlier** are untagged and were encoded with BT.601; a partial re-encode of such a file (`--refine-of` windows) can show a slight colour difference between rewritten windows and copied pieces. Reprocess from the original if this matters.
 - **`--jobs` part boundaries:** parts are stream-copy cuts at keyframes; ProPainter context and stabilization restart at each boundary, and a subtitle across a boundary is processed as two halves (joined again in the SRT).
 - **Whole-frame copies:** the watermark stage copies every frame it buffers, and the subtitle stage copies frames it edits; at 1080p this is a few MB per frame and is small next to inference, but it adds up on very fast GPUs.
-- **Chunk seams:** neighbouring chunks are solved independently (PLANNING Q5, cross-fade not implemented).
+- **Chunk seams:** neighbouring chunks are solved independently (§13 Q5, cross-fade not implemented).
 - **Very short shots** (≥ 1 frame) get the duplicate-frame fallback and little context.
 - **Detection heuristics** (subtitle line, white-glyph masks, watermark) are tuned on Chinese dialogue films with white subtitles and one opaque logo; other styles need parameter changes or manual masks.
 - **CPU-bound stages** (decode, OCR pre-processing, cut detection, mask counting) do not speed up with a faster GPU; a weak CPU on the customer's machine will limit throughput.
@@ -318,3 +336,111 @@ Suggested regression checks: the fixed timestamps listed in PLANNING.md §Valida
 - **Per-video parameters:** `pipeline.process(src, out_dir, args, ...)` reads everything from `args`, so a config-file layer can be added in `cli.py`.
 - **Parallel processing:** `--jobs` for one long video, or several `clean-clear` processes on disjoint folders. Processes writing to the same output directory share `.cache/` (keys include the file fingerprint, so they do not collide) and the skip-if-finished check.
 - **Tests:** add a pytest under `tests/`; `conftest.py` has helpers for synthetic videos, and `tests/test_pipeline.py` shows how to drive `process()` with a fake OCR and backend.
+
+## 12. Defect investigations
+
+Notes kept for their method and data. Test clip: `燕赤霞传之情迷兰若寺.mp4`, 1920×1080, 25 fps, 7515 frames; investigated 2026-09-24.
+
+### 12.1 Dark, flickering blobs at ~0:25 (ProPainter)
+
+**Symptom.** Around 0:24–0:27 (subtitle "能杀我的妖 还没出生呢", frames 621–685) the ProPainter output showed dark, irregular blobs with straight edges where the subtitle had been. Their shape changed every frame, so they read as flicker. The LaMa output of the same frames was clean.
+
+**Experiments.** Each one re-ran ProPainter on this subtitle only (band rows 816–1024 unless noted) and compared frames 630 / 640 / 650.
+
+| # | Hypothesis | Experiment | Result |
+|---|---|---|---|
+| 1 | fp16 overflow / precision | same chunk (frames 590–700) in fp16 vs fp32 | identical blobs → rejected |
+| 2 | black letterbox dragged into the fill (bar starts at row 975) | band 816–968, letterbox excluded | blobs remain, different shape → rejected |
+| 3 | subtitle shadow not covered by the mask | overlay of the glyph mask on frame 640 | mask fully covers glyphs and shadow → rejected |
+| 4 | mask too small | glyph mask grow 14 / shadow 6, and full box mask | blobs get **larger**, dark red → the fill copies content from elsewhere |
+| 5 | too little context for flow completion | taller bands: 208 / 464 / 624 px, frames 605–675 | **all clean, including the 208 px reference** → the frame range matters, not the band height |
+| 6 | a specific frame range is the source | frames 590–675 vs 605–700, band 208 px | 590–675 clean, 605–700 blobs → source is in frames 676–700 |
+
+Side result of #5: peak VRAM grows with band height (7.0 / 15.6 / 20.3 GB for 71 frames at 208 / 464 / 624 px).
+
+**Root cause.** Frame-difference analysis found shot cuts at frames 607, 666 and 695, so the subtitle spans three shots: 607–665 a foggy wide shot (where the blobs appear), 666–694 a close-up with a large dark robe exactly where the subtitle is, 695– a red-robe close-up. ProPainter treats every frame of a chunk as one continuous shot and propagates pixels between them along the completed optical flow. The chunk crossed the cuts, so dark robe pixels from the close-ups were copied into the masked area of the foggy shot, whose low texture gives almost no reliable flow of its own. The more frames of the other shots a chunk contains, the worse it gets, which matches experiments 5 and 6.
+
+**Fix.** Shot cut detection (§4.5) and cut-aware chunking (§5.3): a plain difference threshold found 345 "cuts" in the 5-minute clip (fire, flashes, fast motion in the intro), the spike rule 123 (5–8 per 30 s in the dialogue part, keeping 607 / 666 / 695), in ~11 s. Result on the clip: 75 chunks (was 58), none crossing a cut, all subtitle frames covered, 5293 frames processed (was 4792). One-frame shots are handled by duplicating the frame. Verified offline (cut positions, chunk layout, streaming order with a fake engine) and with a full ProPainter run on the A10: 123 cuts in 16 s, erase + encode 2139 s, the blobs at 25.2 / 25.6 / 26.0 / 26.4 s gone, check points 1:53, 2:30, 2:56 and 4:05 unchanged.
+
+### 12.2 Subtitle left unerased at 2:56 (fixed in `ec57a9e`)
+
+**Symptom.** At 2:56 most of "比如说我们有一个新产品" stayed visible in the ProPainter output; only the middle part was erased.
+
+**Root cause.** The erased part matched the previous subtitle "你看" (two centred characters). With `--pad-frames 1`, frame 4399 belonged both to the padding of "你看" and to the start of the new subtitle but only received the earlier subtitle's mask. The new subtitle was unmasked on that frame: LaMa left a one-frame flash, and ProPainter treated the text as real background and propagated it into the following frames. 14 of 99 subtitle transitions in the clip are back to back.
+
+**Fix.** `masks.frame_masks` gives such frames the union of all covering subtitles' masks (§4.4). The delivered file was repaired by re-running only the 11 affected chunks and compositing them onto the original.
+
+### 12.3 Lessons
+
+- Video inpainting must never mix shots: detect cuts before planning chunks.
+- Any frame that is not masked is ground truth for ProPainter and can be propagated far; masking errors that are invisible with LaMa (one frame) become obvious with ProPainter.
+- Reproduce on a short range first, then bisect the frame range; that located the source quickly after the parameter-based hypotheses failed.
+
+## 13. Roadmap
+
+Effort estimates are rough; expected gains are untested unless marked done.
+
+### 13.1 Quality
+
+Smearing appears where the background behind the subtitle has to be invented rather than copied from another frame. Background visible anywhere in the same shot can be restored almost perfectly; background covered for the whole shot can only be made plausible and temporally stable. Causes:
+
+1. **Short temporal reach**: each chunk sees only ~5 s (120 frames + 10 context frames per side); background exposed earlier or later in the shot is never used.
+2. **Wrong completed flow**: flow inside the mask is completed by the model, and its errors drag pixels along (the classic smear). The band is only ~40 px taller than the text on each side, which gives RAFT little context.
+3. **Chunks crossing shot cuts**: fixed by Q1 (§12.1).
+4. **Chunk seams**: neighbouring chunks are solved independently, so results can jump at chunk boundaries.
+5. **Never-exposed regions**: the transformer hallucinates them per frame window; results are soft and may drift between windows (partly mitigated by `stabilize`, §4.9).
+
+| # | Item | Fixes | Effort | Status |
+|---|---|---|---|---|
+| Q1 | Shot detection; chunks never cross a cut | 3 | 0.5 d | ✅ done, verified on the test clip |
+| Q2 | **Clean plate for static shots**: per shot, estimate camera motion; if static, fill every masked pixel from the nearest frame of the shot where it is unmasked (temporal median of unmasked observations) | 1, 2 for static shots | 1 d | P0, open |
+| Q3 | **Shot-wide reference frames**: pick ProPainter's non-local references from the whole shot, preferring frames where the masked area is exposed | 1 | 0.5–1 d | P1, open |
+| Q4 | **Taller band** for flow estimation, pasting back only masked pixels. At 0:25: VRAM 7.0 → 15.6 → 20.3 GB for 208 → 464 → 624 px, no visible gain once the shot-cut problem was fixed | 2 | 0.25 d | P2, open |
+| Q5 | **Overlapping chunks with cross-fade** of the overlapping frames | 4 | 0.5 d | P2, open |
+| Q6 | **Inpaint once, propagate**: for pixels never exposed in a shot, inpaint one keyframe (LaMa or a diffusion model such as DiffuEraser) and propagate it along the completed flow | 5 | 1–2 d | P2, open |
+
+Q1 + Q2 are expected to remove most visible smearing: static dialogue shots are the most common and most noticeable case. Q2 also saves time, because pixels filled from a clean plate need no network inference.
+
+### 13.2 Performance
+
+| # | Item | Expected gain | Effort | Status |
+|---|---|---|---|---|
+| P1 | Horizontal crop around the subtitle (§5.3) | ~2× | 0.25 d | ✅ done |
+| P2 | Fewer RAFT iterations (20 → 12); flow is ~30–40 % of the time | 20–30 % | 0.1 d | ✅ done; quality not yet validated on a large sample |
+| P3 | Less redundant work: smaller context/padding, reuse flow of overlapping context frames | 15–20 % | 0.5 d | ⚠️ partial: `--pp-ctx` / `--pp-pad` are tunable; flow reuse across chunks needs an engine refactor to cache flow between calls |
+| P4 | Decode, inference and encode in separate threads | 10–20 % | 0.5 d | ✅ done (`prefetch`, `ThreadedWriter`) |
+| P5 | Half-resolution mode (optional): inpaint the band at 0.5×, upscale only the inpainted pixels | 2–4× | 0.5 d | P2, open; trades sharpness |
+| P6 | Batch small chunks; `torch.compile` / TensorRT for the inpainting network | 10–30 % | 1 d | P3, open |
+
+Also done since: `--jobs` with optional NVIDIA MPS (§4.8, §4.9).
+
+### 13.3 Suggested order
+
+1. **Q2**: biggest remaining visible quality gain.
+2. **Q3, P3** (flow reuse).
+3. **Q4, Q5, Q6, P5, P6**: only if still needed.
+
+## 14. Alternative inpainting models (survey, 2026-09-28)
+
+Desk research only; none of these has been run on our clips. Speeds and memory are from the papers / READMEs.
+
+| Model | Type | Quality | Cost | Availability / licence |
+|---|---|---|---|---|
+| **ProPainter** (current, ICCV 2023) | RAFT flow + flow completion + propagation and sparse transformer; no diffusion | very good when the background is exposed elsewhere in the shot, no hallucination risk; soft where it never is; fast motion smears | ≈ 13 fps overall on an A10 for a 720p film (subtitle crop only, measured); ≈ 13 GB at chunk 120, fits 8 GB at chunk 60–80 | open source, NTU S-Lab 1.0, **non-commercial** |
+| **DiffuEraser** (2025) | diffusion (SD-based) refining a ProPainter prior | sharper in never-exposed areas | much slower; runs ProPainter first anyway | Apache-2.0, bundled ProPainter parts keep ProPainter's licence |
+| **MiniMax-Remover** (2025) | video diffusion, 6 steps, general object removal | strong on objects | ≈ 3.4 fps at 480p on an A800, ≈ 14 GB; 1080p much more | open source. **Dropped**: trained on object masks, works at 480×832 (thin strokes get lost) and still needs our masks |
+| **EraserDiT** (2025) | diffusion transformer video inpainting | reported good | "fast" for a diffusion method | paper |
+| **SEDiT** (Baidu, arXiv 2605.14894, May 2026) | subtitle-specific, **mask-free**, one-step DiT on LTX-Video-2B + LoRA | vs MiniMax-Remover on VSR-Bench-400: PSNR 31.59 vs 28.31, FVD 24.06 vs 39.35, MOS 4.5 vs 2.5 | 1080p, 65 frames in ≈ 4 s on an A800 80 GB (≈ 16 fps); likely > 24 GB at 1080p full frame | project page only, **no code or weights** (checked 2026-09-28); © Baidu. Contact: Zheng Hui (zheng_hui@aliyun.com), Yunlong Bai (baiyunlong@baidu.com) |
+| **CLEAR** (ICML 2026, arXiv 2603.21901) | subtitle-specific, **mask-free**, LoRA (rank 64) on Wan2.1-Fun-1.3B, 5 steps, 81-frame sliding window | +6.77 dB PSNR, −74.7 % VFID vs ProPainter / DiffuEraser / MiniMax-Remover on Chinese subtitles | ≈ 4.86 s per frame, ≈ 1,000 GPU-days for 200 h of video | code and weights released, Apache-2.0, but the model card says **research purposes only** |
+
+**Not applicable:** NVIDIA DLSS 5 (game frames with engine motion vectors, no SDK for arbitrary video, does not reconstruct occluded content); RTX Video Super Resolution / HDR and Maxine Video Effects (no inpainting). TensorRT is an accelerator for ProPainter, not a model (P6).
+
+**Using CLEAR for experiments.** Install [Wan2.1](https://github.com/Wan-Video/Wan2.1) and [DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio) (torch ≥ 2.4), the Wan2.1 1.3B base model and the LoRA checkpoint `CLEAR-mask-free-subtitle-removal.pt`, then `python inference.py --model_base_path <Wan2.1-Fun-V1.1-1.3B-Control> --lora_checkpoint ./checkpoints/CLEAR-mask-free-subtitle-removal.pt --lora_rank 64 --input_video input.mp4 --output_dir ./results --num_steps 5 --cfg_scale 1.0 --use_sliding_window` (window 81 frames, overlap 16: `--chunk_size`, `--chunk_overlap`). The README downloads `Wan2.1-T2V-1.3B` but the command points at `Wan2.1-Fun-V1.1-1.3B-Control`; check which base model is required.
+
+**Decision.**
+- Keep **ProPainter**. Our masks are small, the videos are long, and the total volume (≈ 200 h) is throughput-bound; the diffusion models cost several times more compute per frame.
+- **Watch SEDiT**: subtitle-specific, mask-free (our OCR filter and glyph masks are the weakest parts) and fast at 1080p. If it is released, benchmark it on the fixed check points (§9); it would replace masking and erasing, while OCR would still produce the SRT.
+- **CLEAR** is too slow for 200 h and research-only; use it at most as a quality reference on a few shots.
+- Speed should come from P6 and Q2 rather than from a model change.
+
+Sources: [ProPainter](https://github.com/sczhou/ProPainter), [DiffuEraser](https://github.com/lixiaowen-xw/diffueraser), [MiniMax-Remover](https://arxiv.org/pdf/2505.24873), [EraserDiT](https://arxiv.org/html/2506.12853v2), [SEDiT](https://arxiv.org/abs/2605.14894) ([project](https://zheng222.github.io/SEDiT_project/)), [CLEAR](https://arxiv.org/abs/2603.21901) ([code](https://github.com/silent-commit/CLEAR), [weights](https://huggingface.co/charlesw09/CLEAR-mask-free-video-subtitle-removal)), [DLSS 5](https://research.nvidia.com/labs/adlr/DLSS5/).
