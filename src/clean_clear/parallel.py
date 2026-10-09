@@ -24,6 +24,45 @@ _VALUE_OPTS = ["model", "band", "device", "ocr_interval", "ocr_fixed_shape", "en
 _SRT_TIME = re.compile(r"(\d+):(\d\d):(\d\d),(\d{3}) --> (\d+):(\d\d):(\d\d),(\d{3})")
 
 
+def start_mps(mode):
+    """Start the NVIDIA MPS daemon so that the part processes share the GPU concurrently instead of taking turns
+    (about 14 % faster on an L20). `mode`: auto = try, fall back silently; on = try, warn if it fails; off = never.
+    Needs Linux, root and nvidia-cuda-mps-control. -> stop function (a no-op if MPS was not started by us)"""
+    nop = lambda: None
+    if mode == "off" or not sys.platform.startswith("linux"):
+        return nop
+    exe = shutil.which("nvidia-cuda-mps-control")
+    if os.environ.get("CUDA_MPS_PIPE_DIRECTORY") and Path(os.environ["CUDA_MPS_PIPE_DIRECTORY"], "control").exists():
+        log("  MPS: already running")
+        return nop
+    if not exe or os.geteuid() != 0:
+        if mode == "on":
+            log("  MPS not started: needs root and nvidia-cuda-mps-control; continuing without it")
+        return nop
+    pipe, logd = "/tmp/nvidia-mps", "/tmp/nvidia-mps-log"
+    os.makedirs(pipe, exist_ok=True)
+    os.makedirs(logd, exist_ok=True)
+    env = dict(os.environ, CUDA_MPS_PIPE_DIRECTORY=pipe, CUDA_MPS_LOG_DIRECTORY=logd)
+    try:
+        subprocess.run([exe, "-d"], env=env, check=True, capture_output=True, timeout=30)
+    except (subprocess.SubprocessError, OSError) as e:
+        if mode == "on":
+            log(f"  MPS not started ({e}); continuing without it")
+        return nop
+    os.environ.update(CUDA_MPS_PIPE_DIRECTORY=pipe, CUDA_MPS_LOG_DIRECTORY=logd)
+    log("  MPS: started")
+
+    def stop():
+        try:
+            subprocess.run([exe], input="quit\n", text=True, env=env, capture_output=True, timeout=30)
+        except (subprocess.SubprocessError, OSError):
+            pass
+        for k in ("CUDA_MPS_PIPE_DIRECTORY", "CUDA_MPS_LOG_DIRECTORY"):
+            os.environ.pop(k, None)
+        log("  MPS: stopped")
+    return stop
+
+
 def _duration(path):
     out = subprocess.run([_exe("ffprobe"), "-v", "error", "-show_entries", "format=duration", "-of",
                           "default=nw=1:nk=1", str(path)], capture_output=True, text=True, check=True).stdout
@@ -111,6 +150,16 @@ def process_parallel(src, out_dir, args):
     running = {}  # slot -> (part index, Popen)
     done = []
     last_report = time.time()
+    stop_mps = start_mps(args.mps)
+    try:
+        _run_parts(args, files, work, wm, groups, pending, running, done, t_all, last_report)
+    finally:
+        stop_mps()
+    return _merge(src, out_dir, work, files, args, t_all, jobs)
+
+
+def _run_parts(args, files, work, wm, groups, pending, running, done, t_all, last_report):
+    jobs = args.jobs
     while pending or running:
         for slot in range(jobs):
             if slot not in running and pending:
@@ -139,6 +188,8 @@ def process_parallel(src, out_dir, args):
             for slot, (k, _) in sorted(running.items()):
                 log(f"  part {k + 1}: {_last_progress(work / f'out{k:02d}' / 'clean-clear.log')}")
 
+
+def _merge(src, out_dir, work, files, args, t_all, jobs):
     # merge: subtitles (time-shifted), video (stream copy) + the original audio
     cues, offset = [], 0.0
     for k, f in enumerate(files):

@@ -48,6 +48,8 @@ class OCR:
         self.engine = RapidOCR(params=params)
         if fixed_shape:
             rec = self.engine.text_rec
+            if rec is None and hasattr(self.engine, "_load_rec_model"):  # rapidocr >= 3.10 loads models lazily
+                rec = self.engine._load_rec_model()
             rec.session = _FixedShape(rec.session, batch=rec.rec_batch_num)
 
     def __call__(self, img):
@@ -98,7 +100,9 @@ def frame_boxes(items, band_y0, W, min_h, min_score):
 
 
 def subtitle_line(per_frame):
-    """Find where subtitles usually sit from all text boxes in the video: (bottom line y-centre, text height)"""
+    """Find where subtitles usually sit from all text boxes in the video: (bottom line y-centre, text height), or
+    (y, height, y2, height2) when a second line is regularly present (bilingual subtitles: the most frequent line
+    is the main one, the second line may be above or below it)"""
     ys = [((b[1] + b[3]) / 2, b[3] - b[1]) for boxes in per_frame for b in boxes]
     if not ys:
         return None
@@ -106,23 +110,36 @@ def subtitle_line(per_frame):
     hs = np.array([h for _, h in ys])
     hist = np.bincount((yc // 4).astype(int))
     mode = (np.argmax(hist) + 0.5) * 4
-    h = float(np.median(hs[np.abs(yc - mode) < 8]))
+    near = np.abs(yc - mode) < 8
+    h = float(np.median(hs[near]))
+    # second line: another peak within two text heights that is at least 30 % as frequent as the main line
+    other = (np.abs(yc - mode) > 0.6 * h) & (np.abs(yc - mode) < 2.5 * h) & (hs > 0.4 * h) & (hs < 1.6 * h)
+    if other.sum() >= 0.3 * near.sum():
+        hist2 = np.bincount((yc[other] // 4).astype(int))
+        mode2 = (np.argmax(hist2) + 0.5) * 4
+        near2 = other & (np.abs(yc - mode2) < 8)
+        if near2.sum() >= 0.3 * near.sum():
+            return mode, h, mode2, float(np.median(hs[near2]))
     return mode, h
 
 
 def filter_line(boxes, line):
-    """Keep only boxes matching the subtitle line position and height (one extra line above is allowed for two-line subtitles)"""
+    """Keep only boxes matching the subtitle line position and height (the second line of a bilingual subtitle, or
+    one extra line above the main line for two-line subtitles, is allowed)"""
     if line is None:
         return boxes
-    mode, h = line
+    mode, h = line[:2]
+    lines = [line[i:i + 2] for i in range(0, len(line), 2)]
+    main = [b for b in boxes
+            if any(0.75 * lh <= b[3] - b[1] <= 1.6 * lh and abs((b[1] + b[3]) / 2 - ly) <= 0.5 * lh
+                   for ly, lh in lines)]
+    if not main:
+        return []
     # Upper bound 1.6: a detector box that also swallows a light streak or edge next to the text (seen at 14:28 of
-    # the test film: 74 px against the usual 52 px) is still the subtitle; the position check below keeps scene text out
+    # the test film: 74 px against the usual 52 px) is still the subtitle; the position check keeps scene text out
     keep = [b for b in boxes
             if 0.75 * h <= b[3] - b[1] <= 1.6 * h
             and mode - 2.5 * h <= (b[1] + b[3]) / 2 <= mode + 0.5 * h]
-    main = [b for b in keep if abs((b[1] + b[3]) / 2 - mode) <= 0.5 * h]
-    if not main:
-        return []
     # An upper line must lie entirely above the subtitle line (boxes overlapping it vertically are scene texture/objects)
     top = min(b[1] for b in main)
     return main + [b for b in keep if b not in main and b[3] <= top + 0.1 * h]

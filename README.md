@@ -35,6 +35,8 @@ scripts\install.bat
 ```
 
 The install script creates a `.venv` virtual environment in the repository root and installs the package in editable mode (`pip install -e .`), which provides the `clean-clear` command in `.venv\Scripts` (Windows) or `.venv/bin` (Linux). It uses the Aliyun PyPI mirror by default (on Linux, override with `PIP_MIRROR=...`).
+
+On a server in mainland China use a local PyPI mirror (Tencent Cloud, Huawei Cloud, ...); see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full server recipe.
 At the end it prints the available inference providers; `CUDAExecutionProvider` means the GPU is ready.
 
 Python dependencies (declared in `pyproject.toml`, installed from PyPI):
@@ -122,6 +124,10 @@ For each video the output directory contains:
 | `--jobs` | `1` | process a long video in this many concurrent processes (split into 2x this many parts at keyframes, merged afterwards; OCR runs in parallel too). On one L20 with 4 processes the GPU was saturated and the whole film took 2 h instead of 3 h+. See [Parallel runs and NVIDIA MPS](#parallel-runs-and-nvidia-mps) |
 | `--keep-parts` | | with `--jobs`, keep the per-part work directory |
 | `--refine-of ORIGINAL` | | INPUT is an already cleaned video of ORIGINAL: erase any subtitle still readable in it and fill logo pixels the first pass missed, in one decode and one encode (writes `NAME_refined.mp4`). About 30 min for a 90-minute film, instead of a full rerun |
+| `--mps` | `auto` | with `--jobs` on Linux, start the NVIDIA MPS daemon for the run and stop it afterwards (needs root; `auto` skips it silently when unavailable, `off` never starts it) |
+| `--find-ads` | | find advertisement pages spliced into a film and list them in `NAME.ads.txt`; nothing is changed. A film with letterbox bars is scanned for full-frame pages (picture in the bars) that are at least 10 s long; one whose picture contains a web address (`www.`, `.com`, ...) is `confirmed`, others are only `suspect` and never cut. Found the 45 s casino page of the test film to the frame |
+| `--cut-ads` | | like `--find-ads`, then cut the confirmed ads out (`NAME_cut.mp4`, `NAME_cut.srt`) |
+| `--cut START-END` | | remove a time range from the INPUT video, frame-exact (`--cut 0:40:01.667-0:40:46.958`, repeatable). Only the keyframe windows around the cut are re-encoded, the rest is copied; audio and SRT follow. Use it on the `*_clean.mp4` result (an mkv whose first frame is not at time 0 is refused) |
 | `--min-height` | `0.015` | minimum text height as a fraction of frame height |
 
 ## How it works

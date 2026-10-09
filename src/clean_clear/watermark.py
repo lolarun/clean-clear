@@ -110,6 +110,20 @@ def _grab(src, t, W, H):
     return np.frombuffer(r.stdout, np.uint8).reshape(H, W, 3)
 
 
+def _bar_zone(gray, black=24, margin=25):
+    """HxW bool: black letterbox/pillarbox bars of a corner crop (rows/columns that are black all along) plus
+    `margin` px of the picture next to them. The sharp, never-changing boundary of a bar would otherwise be
+    detected as a logo."""
+    dark = gray < black
+    rows = dark.mean(1) > 0.97
+    cols = dark.mean(0) > 0.97
+    zone = (rows[:, None] | cols[None, :]).astype(np.uint8)
+    if not zone.any():
+        return zone.astype(bool)
+    k = 2 * margin + 1
+    return cv2.dilate(zone, np.ones((k, k), np.uint8)).astype(bool)
+
+
 def detect(src, W, H, duration, samples=150, tol=14, consistency=0.85, min_area=20, grow=15, near_small=True):
     """-> HxW bool mask of the watermark(s) found in the four corners, or None.
 
@@ -138,6 +152,7 @@ def detect(src, W, H, duration, samples=150, tol=14, consistency=0.85, min_area=
         gray = cv2.cvtColor(med, cv2.COLOR_BGR2GRAY)
         edge = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8))
         cand = (near > consistency) & (cv2.dilate(edge, np.ones((3, 3), np.uint8)) > 25)
+        cand &= ~_bar_zone(gray)  # the picture's edge against a black letterbox bar is static too, but no logo
         cand = cv2.morphologyEx(cand.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
         n, lab, st, _ = cv2.connectedComponentsWithStats(cand, connectivity=8)
         big = [i for i in range(1, n) if st[i, 4] >= min_area]

@@ -15,6 +15,8 @@ from .common import ROOT, __version__, fmt_time, log, set_log_file, usable_cpus
 # BLAS / OpenMP pools default to every core of the host; under a container CPU quota that is very slow
 for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(_var, str(min(8, usable_cpus())))
+from .ads import find_ads, write_report
+from .cutter import cut, parse_ranges
 from .device import gpu_compute_capability, onnx_providers
 from .parallel import process_parallel
 from .pipeline import process
@@ -110,10 +112,23 @@ def build_argparser():
                     help="process a long video in this many concurrent processes (it is split into 2x this many parts at "
                          "keyframes, parts are merged afterwards). Uses the idle CPU/GPU capacity; videos shorter than "
                          "2 min per part run normally (default: 1)")
+    ap.add_argument("--mps", default="auto", choices=["auto", "on", "off"],
+                    help="with --jobs on Linux, start the NVIDIA MPS daemon for the run so the processes share the GPU "
+                         "concurrently (needs root; auto = silently skip if unavailable; default: auto)")
     ap.add_argument("--keep-parts", action="store_true", help="with --jobs, keep the per-part work directory")
     ap.add_argument("--refine-of", metavar="ORIGINAL",
                     help="INPUT is an already cleaned video of ORIGINAL: erase any subtitle still readable in it and fill "
                          "logo pieces the first pass missed, in one decode/encode (writes NAME_refined.mp4)")
+    ap.add_argument("--cut", action="append", metavar="START-END",
+                    help="remove a time range (e.g. an advertisement page) from each INPUT video, frame-exact, writing "
+                         "NAME_cut.mp4 (+ NAME_cut.srt); no OCR or erasing. Times as seconds, M:S or H:M:S.ms, "
+                         "repeatable: --cut 0:40:01.667-0:40:46.958")
+    ap.add_argument("--find-ads", action="store_true",
+                    help="find advertisement pages spliced into each INPUT film (full-frame pages inside a letterboxed "
+                         "film, confirmed by a web address in the picture) and list them in NAME.ads.txt; nothing is "
+                         "changed")
+    ap.add_argument("--cut-ads", action="store_true",
+                    help="like --find-ads, then cut the confirmed ads out (writes NAME_cut.mp4 and NAME_cut.srt)")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return ap
 
@@ -130,6 +145,24 @@ def main(argv=None):
         sys.exit("No video files found")
     out_dir = Path(args.out)
     set_log_file(out_dir / "clean-clear.log")
+    if args.find_ads or args.cut_ads:
+        device, _ = onnx_providers(args.device)
+        ocr = OCR(device, fixed_shape=args.ocr_fixed_shape == "on" or (
+            args.ocr_fixed_shape == "auto" and device == "cuda" and gpu_compute_capability() >= 12.0))
+        for f in files:
+            log(f"\n==> {f.name}: looking for ad pages")
+            ads = find_ads(f, ocr)
+            log(f"  report -> {write_report(f, out_dir, ads)}")
+            sure = [(a["start"], a["end"]) for a in ads if a["status"] == "confirmed"]
+            if args.cut_ads and sure:
+                cut(f, out_dir, sure, pick_encoder(args.encoder), args.crf)
+        return 0
+    if args.cut:
+        ranges = parse_ranges(args.cut)
+        encoder = pick_encoder(args.encoder)
+        for f in files:
+            cut(f, out_dir, ranges, encoder, args.crf)
+        return 0
     log(f"Clean Clear {__version__}: {len(files)} video(s) -> {out_dir.resolve()}")
     models = []
 
