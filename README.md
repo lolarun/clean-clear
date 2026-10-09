@@ -196,6 +196,8 @@ Measured on the same L20 with 90-second clips (other work was running on the mac
 | 8 processes, MPS | slower per clip than 4 | no gain, 30 GB GPU memory |
 | 4 processes, MPS, `--pp-chunk 240` | 451 s | larger chunks were slower |
 
+A part process that hangs (seen 3 times in ~35 parts on the 5090: alive but idle right after loading the models) is detected by the parent, which kills it and restarts that part: after 5 min without a first progress line, or 15 min without any output; at most twice per part. The Python stack of the hung process is saved to `hang_dumps/` if `py-spy` is installed (`pip install py-spy`).
+
 Recommendation: `--jobs 4` with MPS on a 16-core machine with one GPU; this is what `--jobs auto` (the default) picks there.
 
 RTX 5090 (32 GB, 16-core quota), 110-minute 1080p film, 4 processes + MPS, 8 parts: 2 h 9 min. A single process uses ~31 % of the GPU while erasing (182 W of the card's power budget, 6.5 GB, ~6 cores). The last part, the dense credits, took 73 min against 46-56 for the others, so the other 3 processes idled for 29 min at the end (18 % of the process time); parts are therefore now 4 per process (16 for 4 processes) and the last one is started first. If MPS cannot be started (e.g. no root in a container), `--jobs 4` alone still helps.

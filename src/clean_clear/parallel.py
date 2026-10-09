@@ -164,28 +164,85 @@ def process_parallel(src, out_dir, args):
     return _merge(src, out_dir, work, files, args, t_all, jobs)
 
 
+STALL_SECONDS = 900  # a part that has written nothing for this long is hung
+START_STALL_SECONDS = 300  # ... or has not printed its first progress line this long after its start. Seen in 3 of ~35
+MAX_RESTARTS = 2           # parts: the process stayed alive right after loading the models, using no CPU, for hours
+
+
+def _stalled(work, k, started):
+    """Seconds since the part's output files last changed (counted from its start before the first write)"""
+    last = started
+    for f in (work / f"part{k:02d}.out", work / f"out{k:02d}" / "clean-clear.log"):
+        try:
+            last = max(last, f.stat().st_mtime)
+        except OSError:
+            pass
+    return time.time() - last
+
+
+def _dump_stack(p, work, k):
+    """Python stack of a hung part (py-spy, if installed) -> hang_dumps/ next to the work directory"""
+    import shutil as _sh
+    exe = _sh.which("py-spy") or str(Path(sys.executable).with_name("py-spy"))
+    if not Path(exe).exists():
+        return
+    try:
+        out = subprocess.run([exe, "dump", "--pid", str(p.pid), "--native"], capture_output=True, text=True,
+                             timeout=30).stdout
+        d = work.parent / "hang_dumps"
+        d.mkdir(exist_ok=True)
+        (d / f"{work.name}_part{k:02d}_{time.strftime('%H%M%S')}.txt").write_text(out, encoding="utf-8")
+    except (subprocess.SubprocessError, OSError):
+        pass
+
+
+def _kill(p):
+    try:
+        os.killpg(p.pid, 9)  # the part runs in its own session: its ffmpeg children go with it
+    except (OSError, ProcessLookupError):
+        p.kill()
+    p.wait()
+
+
 def _run_parts(args, files, work, wm, groups, pending, running, done, t_all, last_report):
     jobs = args.jobs
+    started, restarts = {}, {}
     while pending or running:
         for slot in range(jobs):
             if slot not in running and pending:
                 k = pending.pop(0)
                 odir = work / f"out{k:02d}"
+                shutil.rmtree(odir, ignore_errors=True)
                 odir.mkdir()
                 cmd = [sys.executable, "-m", "clean_clear", str(files[k]), "-o", str(odir)] + _child_args(args, wm)
                 pin = (lambda c=groups[slot]: os.sched_setaffinity(0, c)) if groups[slot] else None
                 fh = open(work / f"part{k:02d}.out", "w")
-                running[slot] = (k, subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, preexec_fn=pin))
+                running[slot] = (k, subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, preexec_fn=pin,
+                                                     start_new_session=True))
+                started[k] = time.time()
                 log(f"  part {k + 1}/{len(files)} started (slot {slot})")
         time.sleep(3)
         for slot, (k, p) in list(running.items()):
             rc = p.poll()
             if rc is None:
+                no_progress = _last_progress(work / f"out{k:02d}" / "clean-clear.log") == "starting"
+                if _stalled(work, k, started[k]) > (START_STALL_SECONDS if no_progress else STALL_SECONDS):
+                    _dump_stack(p, work, k)
+                    _kill(p)
+                    del running[slot]
+                    restarts[k] = restarts.get(k, 0) + 1
+                    if restarts[k] > MAX_RESTARTS:
+                        for _, q in running.values():
+                            _kill(q)
+                        raise RuntimeError(f"part {k + 1} hung {restarts[k]} times; see {work / f'part{k:02d}.out'}")
+                    log(f"  part {k + 1} hung (no output, no progress): killed, restarting "
+                        f"({restarts[k]}/{MAX_RESTARTS})")
+                    pending.insert(0, k)
                 continue
             del running[slot]
             if rc != 0:
                 for _, q in running.values():
-                    q.terminate()
+                    _kill(q)
                 raise RuntimeError(f"part {k + 1} failed (code {rc}); see {work / f'part{k:02d}.out'}")
             done.append(k)
             log(f"  part {k + 1}/{len(files)} done  ({len(done)}/{len(files)}, {fmt_time(time.time() - t_all)} elapsed)")
