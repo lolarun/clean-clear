@@ -97,11 +97,28 @@ For each video the output directory contains:
 | `-o, --out` | current directory | output directory |
 | `-m, --model` | `propainter` | inpainting model: `propainter` (video model, best quality, default; see below) or `lama` (about 5-7x faster, lower quality) |
 | `--srt-only` | | extract subtitles only, do not erase |
+| `--subtitles` | `on` | `off`: the video has no hardcoded subtitles; skip OCR, SRT and subtitle erasing and only erase the watermark (avoids erasing the credits of a film that has no subtitles). Without a watermark either, nothing is written |
+| `--list FILE` | | batch file: one video per line, `"path" --option value ...`; see [Batch file](#batch-file) |
 | `--band` | `0.70,1.0` | horizontal band containing subtitles, as fractions or pixels. The default is the bottom 30% of the frame; use `0,0.3` for subtitles at the top |
 | `--device` | `auto` | `auto` / `cuda` / `cpu` / `dml` (`dml` requires onnxruntime-directml) |
 | `--crf` | `18` | output quality; lower is sharper and larger. Use `23` for a file size close to the source |
 | `--encoder` | `auto` | `h264_nvenc` when an NVIDIA GPU is present, otherwise `libx264` |
 | `--mask` | `glyph` | `glyph` erases strokes only (recommended); `box` erases the whole text box (try it for non-white subtitles) |
+
+### Batch file
+
+For a set of videos that need different options (some without subtitles, a logo in another corner, ...), list them in a text file and run `clean-clear --list videos.txt -o /data/out`:
+
+```
+# a line starting with DEFAULT sets options for every video below it
+DEFAULT --crf 18
+
+"/data/videos/film one.mp4"
+"/data/videos/film two.mp4"  --subtitles off
+"/data/videos/film three.mp4" --band 0,0.3
+```
+
+The options are the ones of the command line (the call's own options apply to every video, a line overrides them). Videos run one after another, each with `--jobs auto` inside; a video that fails does not stop the others; one whose `NAME_clean.mp4` already exists in the output directory is skipped, so the same file can be run again after an interruption. At the end a summary is logged and written to `batch-status.txt`.
 
 ### Tuning options (rarely needed)
 
@@ -121,7 +138,7 @@ For each video the output directory contains:
 | `--verify` | `on` | after erasing, OCR the result again and erase any subtitle that is still readable (adds one cheap OCR pass; a second decode/encode only if something is found) |
 | `--wm-guard` | `25` | repair a watermark fill whose mean brightness differs from its surroundings by more than this many grey levels (dark-scene flashes); `0` = off |
 | `--stabilize` | `0.6` | blend every inpainted area with the previous frame by up to this weight where its surroundings are static; reduces the frame-to-frame shimmer of the fill that shows at 2x playback. `0` = off |
-| `--jobs` | `1` | process a long video in this many concurrent processes (split into 2x this many parts at keyframes, merged afterwards; OCR runs in parallel too). On one L20 with 4 processes the GPU was saturated and the whole film took 2 h instead of 3 h+. See [Parallel runs and NVIDIA MPS](#parallel-runs-and-nvidia-mps) |
+| `--jobs` | `auto` | process a long video in this many concurrent processes (split into up to 4x this many parts at keyframes, merged afterwards; OCR runs in parallel too). `auto` = up to 4, limited to one process per 7 GB of GPU memory and per 4 usable CPUs (1 with LaMa or without a GPU). On an L20 the GPU was saturated with 4 processes: the whole film took 2 h instead of 3 h+; on an RTX 5090 (16-core quota) 2 h 9 min. Videos shorter than 4 min per process run normally. See [Parallel runs and NVIDIA MPS](#parallel-runs-and-nvidia-mps) |
 | `--keep-parts` | | with `--jobs`, keep the per-part work directory |
 | `--refine-of ORIGINAL` | | INPUT is an already cleaned video of ORIGINAL: erase any subtitle still readable in it and fill logo pixels the first pass missed, in one decode and one encode (writes `NAME_refined.mp4`). About 30 min for a 90-minute film, instead of a full rerun |
 | `--mps` | `auto` | with `--jobs` on Linux, start the NVIDIA MPS daemon for the run and stop it afterwards (needs root; `auto` skips it silently when unavailable, `off` never starts it) |
@@ -179,7 +196,9 @@ Measured on the same L20 with 90-second clips (other work was running on the mac
 | 8 processes, MPS | slower per clip than 4 | no gain, 30 GB GPU memory |
 | 4 processes, MPS, `--pp-chunk 240` | 451 s | larger chunks were slower |
 
-Recommendation: `--jobs 4` with MPS on a 16-core machine with one GPU. If MPS cannot be started (e.g. no root in a container), `--jobs 4` alone still helps.
+Recommendation: `--jobs 4` with MPS on a 16-core machine with one GPU; this is what `--jobs auto` (the default) picks there.
+
+RTX 5090 (32 GB, 16-core quota), 110-minute 1080p film, 4 processes + MPS, 8 parts: 2 h 9 min. A single process uses ~31 % of the GPU while erasing (182 W of the card's power budget, 6.5 GB, ~6 cores). The last part, the dense credits, took 73 min against 46-56 for the others, so the other 3 processes idled for 29 min at the end (18 % of the process time); parts are therefore now 4 per process (16 for 4 processes) and the last one is started first. If MPS cannot be started (e.g. no root in a container), `--jobs 4` alone still helps.
 
 ## ProPainter model (optional)
 

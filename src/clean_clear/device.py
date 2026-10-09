@@ -32,3 +32,13 @@ def gpu_compute_capability():
         return 0.0
     caps = [float(l) for l in out.split() if re.fullmatch(r"\d+\.\d+", l)]
     return max(caps, default=0.0)
+
+
+def gpu_memory_gb():
+    """Memory of the first NVIDIA GPU in GB, 0.0 if there is none or nvidia-smi is missing"""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=15).stdout.split()
+        return float(out[0]) / 1024
+    except Exception:
+        return 0.0

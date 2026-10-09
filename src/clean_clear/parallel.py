@@ -17,7 +17,7 @@ from .pipeline import watermark_mask
 from .video import _exe, probe
 
 # options forwarded to the part processes (argparse dest names)
-_VALUE_OPTS = ["model", "band", "device", "ocr_interval", "ocr_fixed_shape", "encoder", "crf", "mask", "dilate",
+_VALUE_OPTS = ["model", "subtitles", "band", "device", "ocr_interval", "ocr_fixed_shape", "encoder", "crf", "mask", "dilate",
                "grow", "shadow", "pad_frames", "max_gap", "min_dur", "min_score", "min_height", "extend_sec",
                "verify", "wm_guard", "stabilize", "propainter_dir", "pp_chunk", "pp_raft_iter", "pp_ctx", "pp_pad",
                "pp_margin", "pp_ref_stride"]
@@ -80,7 +80,7 @@ def _child_args(args, wm):
     cmd = []
     for name in _VALUE_OPTS:
         cmd += ["--" + name.replace("_", "-"), str(getattr(args, name))]
-    cmd += ["--watermark", wm]
+    cmd += ["--watermark", wm, "--jobs", "1"]  # a part is never split again
     if args.no_cache:
         cmd.append("--no-cache")
     return cmd
@@ -127,9 +127,11 @@ def process_parallel(src, out_dir, args):
     W, H, fps, n = probe(src)
     duration = n / fps
     jobs = args.jobs
-    parts = jobs * 2
-    if duration < 120 * parts:
+    if duration < 240 * jobs:  # less than 2 min per part with the minimum of 2 parts per process
         return False
+    # 4 parts per process, not fewer: the work per part differs a lot (the dense credits at the end of a film took
+    # 73 min where the others took 46-56, so with 2 parts per process 3 of 4 processes idled for 29 min at the end)
+    parts = min(jobs * 4, int(duration // 120))
     out_dir.mkdir(parents=True, exist_ok=True)
     t_all = time.time()
     work = out_dir / f".parts_{src.stem}"
@@ -141,12 +143,16 @@ def process_parallel(src, out_dir, args):
     if wm == "auto":  # detect once on the whole film, hand the same mask to every part
         m = watermark_mask(src, out_dir, W, H, fps, n, args)
         wm = str(out_dir / ".cache" / f"{src.stem}.watermark.png") if m is not None else "off"
+    if args.subtitles == "off" and wm == "off":  # nothing to erase: let the normal path say so
+        shutil.rmtree(work, ignore_errors=True)
+        return False
     files = _split(src, work, parts, duration)
     log(f"  split into {len(files)} parts ({time.time() - t_all:.0f}s)")
 
     cpus = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else []
     groups = [cpus[k::jobs] for k in range(jobs)] if cpus else [None] * jobs  # interleaved: hyper-thread siblings stay together
     pending = list(range(len(files)))
+    pending.insert(0, pending.pop())  # the last part first: it holds the credits, the densest subtitles of a film
     running = {}  # slot -> (part index, Popen)
     done = []
     last_report = time.time()

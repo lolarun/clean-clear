@@ -17,7 +17,7 @@ for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(_var, str(min(8, usable_cpus())))
 from .ads import find_ads, write_report
 from .cutter import cut, parse_ranges
-from .device import gpu_compute_capability, onnx_providers
+from .device import gpu_compute_capability, gpu_memory_gb, onnx_providers
 from .parallel import process_parallel
 from .pipeline import process
 from .refine import refine
@@ -53,6 +53,13 @@ def build_argparser():
                          "(default: bottom 30%%)")
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "dml", "cpu"],
                     help="device for OCR and LaMa (ProPainter always uses CUDA if available)")
+    ap.add_argument("--subtitles", default="on", choices=["on", "off"],
+                    help="off: the video has no hardcoded subtitles; skip OCR, SRT and subtitle erasing and only erase the "
+                         "watermark (default: on)")
+    ap.add_argument("--list", metavar="FILE",
+                    help="batch file: one video per line, '\"path\" --option value ...' (options as on the command line, "
+                         "they override the DEFAULT line); '#' starts a comment. Videos run one after another, a failed "
+                         "one does not stop the rest, videos whose NAME_clean.mp4 already exists are skipped")
     ap.add_argument("--srt-only", action="store_true", help="extract subtitles only, do not erase")
     ap.add_argument("--no-cache", action="store_true", help="ignore the OCR cache and run OCR again")
     ap.add_argument("--ocr-interval", type=int, default=10,
@@ -108,10 +115,11 @@ def build_argparser():
                     help="frame interval between global reference frames fed to the transformer fusion step; "
                          "lower it for more temporal consistency (less flicker in dark/fast-motion scenes) at the "
                          "cost of speed and VRAM")
-    ap.add_argument("--jobs", type=int, default=1,
-                    help="process a long video in this many concurrent processes (it is split into 2x this many parts at "
-                         "keyframes, parts are merged afterwards). Uses the idle CPU/GPU capacity; videos shorter than "
-                         "2 min per part run normally (default: 1)")
+    ap.add_argument("--jobs", default="auto",
+                    help="process a long video in this many concurrent processes (it is split into up to 4x this many "
+                         "parts at keyframes, parts are merged afterwards). Uses the idle CPU/GPU capacity; videos "
+                         "shorter than 4 min per process run normally. auto: up to 4, limited by one process per "
+                         "7 GB of GPU memory and per 4 usable CPUs; 1 with LaMa or without a GPU (default: auto)")
     ap.add_argument("--mps", default="auto", choices=["auto", "on", "off"],
                     help="with --jobs on Linux, start the NVIDIA MPS daemon for the run so the processes share the GPU "
                          "concurrently (needs root; auto = silently skip if unavailable; default: auto)")
@@ -133,11 +141,87 @@ def build_argparser():
     return ap
 
 
+def auto_jobs(args):
+    """Concurrent processes for --jobs auto: one ProPainter process needs ~6.5 GB of GPU memory and ~4 CPU cores,
+    more than 4 did not help on an L20 or an RTX 5090 (GPU and CPU quota are then the limit)"""
+    if args.model != "propainter" or args.device == "cpu" or args.srt_only:
+        return 1
+    return max(1, min(4, int(gpu_memory_gb() // 7), usable_cpus() // 4))
+
+
+def read_list(path):
+    """Batch file -> [(video path, [option tokens])]; the DEFAULT line's options come first (so a line overrides them)"""
+    import shlex
+    default, entries = [], []
+    for n, raw in enumerate(Path(path).read_text(encoding="utf-8-sig").splitlines(), 1):
+        try:
+            tokens = shlex.split(raw, comments=True)
+        except ValueError as e:
+            sys.exit(f"{path}:{n}: {e}")
+        if not tokens:
+            continue
+        if tokens[0] == "DEFAULT":
+            default = tokens[1:]
+        elif tokens[0].startswith("-"):
+            sys.exit(f"{path}:{n}: a line starts with the video path, got {tokens[0]!r}")
+        else:
+            entries.append((tokens[0], default + tokens[1:]))
+    return entries
+
+
+def run_list(args, argv):
+    """--list: run every video of the batch file with its own options; -> exit code (1 if any video failed)"""
+    base = []  # command-line options of this call, without --list itself, apply to every video
+    skip = False
+    for tok in argv:
+        if skip:
+            skip = False
+        elif tok == "--list":
+            skip = True
+        elif not tok.startswith("--list="):
+            base.append(tok)
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    set_log_file(out_dir / "clean-clear.log")
+    entries = read_list(args.list)
+    log(f"Clean Clear {__version__}: batch of {len(entries)} video(s) from {args.list} -> {out_dir.resolve()}")
+    results = []
+    for k, (video, opts) in enumerate(entries, 1):
+        stem = Path(video).stem
+        t0 = time.time()
+        if (out_dir / (stem + "_clean.mp4")).exists():
+            results.append((video, "skipped (already done)", 0.0))
+            log(f"\n##### [{k}/{len(entries)}] {Path(video).name}: already done, skipped")
+            continue
+        log(f"\n##### [{k}/{len(entries)}] {Path(video).name}  options: {' '.join(opts) or '(defaults)'}")
+        try:
+            code = main(base + opts + [video])
+        except SystemExit as e:
+            code = e.code if isinstance(e.code, int) else 1
+            log(f"!! {Path(video).name}: {e.code}")
+        except Exception as e:
+            code = 1
+            log(f"!! {Path(video).name}: {e}")
+        made = (out_dir / (stem + "_clean.mp4")).exists()
+        status = "ok" if code in (0, None) and made else "no output (nothing to erase)" if code in (0, None) else "FAILED"
+        results.append((video, status, time.time() - t0))
+    log("\n===== batch summary =====")
+    lines = [f"{Path(v).name}\t{st}\t{fmt_time(sec) if sec else '-'}" for v, st, sec in results]
+    for line in lines:
+        log("  " + line.replace("\t", "   "))
+    (out_dir / "batch-status.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return 1 if any(st == "FAILED" for _, st, _ in results) else 0
+
+
 def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="replace")  # never crash on a console code page when printing subtitles
+    argv = sys.argv[1:] if argv is None else list(argv)
     args = build_argparser().parse_args(argv)
+    if args.list:
+        return run_list(args, argv)
+    args.jobs = auto_jobs(args) if args.jobs == "auto" else max(1, int(args.jobs))
     import cv2
     cv2.setNumThreads(min(8, usable_cpus()))
     files = collect_inputs(args.inputs)

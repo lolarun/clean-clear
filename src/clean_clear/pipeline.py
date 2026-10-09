@@ -131,34 +131,41 @@ def process(src, out_dir, args, ocr, backend, encoder):
     band = parse_band(args.band, H)
     log(f"\n==> {src.name}  {W}x{H} {fps:.3f}fps  ~{n} frames  subtitle band y={band[0]}-{band[1]}")
 
-    # Pass 1: OCR (raw results are cached as JSON so reruns skip recognition)
-    t0 = time.time()
-    cache = out_dir / ".cache" / f"{src.stem}.{band[0]}-{band[1]}.ocr.json"
-    if cache.exists() and not args.no_cache:
-        per_frame = json.loads(cache.read_text(encoding="utf-8"))
-        log(f"  using OCR cache {cache}")
+    if args.subtitles == "off":  # watermark only: no OCR, no SRT, no subtitle masks
+        line, segs = None, []
+        log("  subtitles off: only the watermark is erased")
     else:
-        per_frame = run_ocr(src, W, H, n, band, ocr, args)
-        cache.parent.mkdir(exist_ok=True)
-        cache.write_text(json.dumps(per_frame, ensure_ascii=False), encoding="utf-8")
-    line, segs = segments_from_ocr(per_frame, fps, max_gap=args.max_gap, min_dur=args.min_dur)
-    if line:
-        log(f"  subtitle line y~{line[0]:.0f}, text height ~{line[1]:.0f}px")
-    srt = out_dir / (src.stem + ".srt")
-    write_srt(segs, fps, srt)
-    log(f"  {len(segs)} subtitles -> {srt}  ({time.time() - t0:.0f}s)")
+        # Pass 1: OCR (raw results are cached as JSON so reruns skip recognition)
+        t0 = time.time()
+        cache = out_dir / ".cache" / f"{src.stem}.{band[0]}-{band[1]}.ocr.json"
+        if cache.exists() and not args.no_cache:
+            per_frame = json.loads(cache.read_text(encoding="utf-8"))
+            log(f"  using OCR cache {cache}")
+        else:
+            per_frame = run_ocr(src, W, H, n, band, ocr, args)
+            cache.parent.mkdir(exist_ok=True)
+            cache.write_text(json.dumps(per_frame, ensure_ascii=False), encoding="utf-8")
+        line, segs = segments_from_ocr(per_frame, fps, max_gap=args.max_gap, min_dur=args.min_dur)
+        if line:
+            log(f"  subtitle line y~{line[0]:.0f}, text height ~{line[1]:.0f}px")
+        srt = out_dir / (src.stem + ".srt")
+        write_srt(segs, fps, srt)
+        log(f"  {len(segs)} subtitles -> {srt}  ({time.time() - t0:.0f}s)")
     if backend is None:
         return
 
     # One fixed mask per subtitle keeps the result temporally stable
     t0 = time.time()
-    if args.mask == "glyph":
-        masks = glyph_masks(src, W, H, band, segs, args.dilate, args.grow, args.shadow, total=n,
-                            extend=round(args.extend_sec * fps))
+    if not segs:
+        frame_seg, masks = {}, {}
     else:
-        masks = box_masks(segs, H, W, args.dilate)
-    frame_seg, masks = frame_masks(segs, masks, args.pad_frames)
-    log(f"  {args.mask} masks done ({time.time() - t0:.0f}s)")
+        if args.mask == "glyph":
+            masks = glyph_masks(src, W, H, band, segs, args.dilate, args.grow, args.shadow, total=n,
+                                extend=round(args.extend_sec * fps))
+        else:
+            masks = box_masks(segs, H, W, args.dilate)
+        frame_seg, masks = frame_masks(segs, masks, args.pad_frames)
+        log(f"  {args.mask} masks done ({time.time() - t0:.0f}s)")
 
     cuts = []
     if getattr(backend, "uses_cuts", False):
@@ -167,6 +174,9 @@ def process(src, out_dir, args, ocr, backend, encoder):
         log(f"  {len(cuts)} shot cuts ({time.time() - t0:.0f}s)")
 
     wm = watermark_mask(src, out_dir, W, H, fps, n, args)
+    if wm is None and not frame_seg:
+        log("  nothing to erase (no subtitles, no watermark); no output written")
+        return
 
     # Pass 2: erase + encode
     t0 = time.time()
@@ -187,8 +197,9 @@ def process(src, out_dir, args, ocr, backend, encoder):
             if args.wm_guard > 0:
                 stream = watermark.guard_fill(stream, wm, args.wm_guard)
             stream = stabilize(stream, {i: 0 for i in range(n + 50)}, {0: wm}, cuts, args.stabilize, label="watermark")
-        stream = stabilize(backend.erase(stream, frame_seg, masks, cuts), frame_seg, masks, cuts, args.stabilize,
-                           label="subtitles")
+        if frame_seg:
+            stream = stabilize(backend.erase(stream, frame_seg, masks, cuts), frame_seg, masks, cuts, args.stabilize,
+                               label="subtitles")
         for frame in stream:
             tw.write(np.ascontiguousarray(frame).tobytes())
             written += 1
@@ -199,7 +210,7 @@ def process(src, out_dir, args, ocr, backend, encoder):
         raise RuntimeError(f"ffmpeg encoding failed (code {wr.returncode})")
     log(f"  video -> {dst}  ({time.time() - t0:.0f}s, {backend.name})")
 
-    if args.verify == "on":
+    if args.verify == "on" and args.subtitles == "on":
         t0 = time.time()
         verify_and_fix(src, dst, W, H, fps, n, band, line, cuts, args, ocr, backend, encoder)
         log(f"  verify done ({time.time() - t0:.0f}s)")
