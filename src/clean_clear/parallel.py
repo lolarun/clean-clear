@@ -167,6 +167,8 @@ def process_parallel(src, out_dir, args):
 STALL_SECONDS = 900  # a part that has written nothing for this long is hung
 START_STALL_SECONDS = 300  # ... or has not printed its first progress line this long after its start. Seen in 3 of ~35
 MAX_RESTARTS = 2           # parts: the process stayed alive right after loading the models, using no CPU, for hours
+LAUNCH_GAP = 20  # seconds between two part starts: every hang so far happened in the CUDA/ONNX start-up of a process
+                 # that started together with others under MPS, so the processes are started one after another
 
 
 def _stalled(work, k, started):
@@ -207,9 +209,11 @@ def _kill(p):
 def _run_parts(args, files, work, wm, groups, pending, running, done, t_all, last_report):
     jobs = args.jobs
     started, restarts = {}, {}
+    last_launch = 0.0
     while pending or running:
         for slot in range(jobs):
-            if slot not in running and pending:
+            if slot not in running and pending and time.time() - last_launch >= LAUNCH_GAP:
+                last_launch = time.time()
                 k = pending.pop(0)
                 odir = work / f"out{k:02d}"
                 shutil.rmtree(odir, ignore_errors=True)
