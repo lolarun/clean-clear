@@ -61,7 +61,10 @@ def read_frames(path, w, h, crop=None, start=0, count=0):
         y0, y1 = crop
         cmd += ["-vf", f"crop={w}:{y1 - y0}:0:{y0}"]
         h = y1 - y0
-    cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+    # decode at the rate probe() reports and the writer encodes with: a source with irregular time stamps (nominal
+    # 25 fps, average 24.9475) was decoded at 25 fps and written at 24.9475, which stretched the result by up to
+    # 1.4 s over a film (picture late against the audio)
+    cmd += ["-r", f"{_fps(path):.6f}", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=int(w * h * 3 * 4))
     size = w * h * 3
     try:
@@ -87,7 +90,7 @@ def detect_cuts(path, threshold=12.0, ratio=3.0, window=5, total=0, hist_min=0.2
     import cv2
     w, h = 320, 180
     cmd = [_exe("ffmpeg"), "-v", "error", "-i", str(path), "-map", "0:v:0", "-vf", f"scale={w}:{h}",
-           "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+           "-r", f"{_fps(path):.6f}", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]  # same frame numbering as read_frames
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=w * h * 3 * 16)
     diffs, hdiffs, prev, prev_h = [], [], None, None
     prog = Progress("cuts", total) if total else None
