@@ -190,7 +190,10 @@ def process(src, out_dir, args, ocr, backend, encoder):
     prog = Progress("erase", n, cum=np.concatenate([[0.0], np.cumsum(cost)]))
     try:
         # decoding (ffmpeg) overlaps with inference in the main thread instead of alternating with it
-        stream = prefetch(read_frames(src, W, H))
+        # at most n frames (duration x fps): decoding a part cut out of a film with a stale frame rate in its header
+        # (nominal 25 fps, average 24.9475) yields ~2 repeated frames at its end; 16 parts later the picture was
+        # 1.5 s late against the audio
+        stream = prefetch(read_frames(src, W, H, count=n))
         if wm is not None:  # watermark: the same erase() on every frame; chained lazily, so still one decode + one encode
             log("  erasing watermark on every frame")
             stream = backend.erase(stream, {i: 0 for i in range(n + 50)}, {0: wm}, cuts)
