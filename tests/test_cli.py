@@ -57,10 +57,10 @@ def test_finished_videos_are_skipped_and_failures_logged_with_traceback(tmp_path
         raise ValueError("broken file")
 
     monkeypatch.setattr(cli, "process", fake_process)
-    assert cli.main([str(tmp_path), "-o", str(tmp_path)]) == 1
+    assert cli.main([str(tmp_path), "-o", str(tmp_path), "--jobs", "1"]) == 1
     assert calls == ["bad.mp4"]
     out = capsys.readouterr().out
     assert "skipping done.mp4" in out and "Traceback" in out and "ValueError: broken file" in out
     calls.clear()
-    cli.main([str(tmp_path), "-o", str(tmp_path), "--force"])
+    cli.main([str(tmp_path), "-o", str(tmp_path), "--force", "--jobs", "1"])
     assert calls == ["bad.mp4", "done.mp4"]

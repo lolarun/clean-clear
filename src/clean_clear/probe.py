@@ -34,6 +34,8 @@ SUB_SAMPLES = 200
 SUB_MIN_HIT = 0.12   # share of sampled frames with text on the subtitle line; dialogue films are far above it
 SUB_MIN_LINE = 0.5   # share of the text boxes that sit on the detected line(s): scattered scene text is below it
 LOOSE_RATIO = 1.8    # loose / strict logo mask size above this -> strict mask probably incomplete
+LIBRARY_RATIO = 2.5  # a library mask this many times larger than the detected one -> detected one is incomplete
+SUB_MAX_HEIGHT = 0.15  # a subtitle line is at most this share of the frame height; larger text is scene text
 AUDIO_FRAME = {"aac": 1024, "mp3": 1152, "ac3": 1536, "eac3": 1536, "mp2": 1152}
 
 
@@ -149,6 +151,8 @@ def check_subtitles(video, W, H, duration, ocr, args):
         band = parse_band(spec, H)
         s = _subtitles_in(video, W, H, band, duration, ocr, args)
         found = s["hit"] >= SUB_MIN_HIT and s["on_line"] >= SUB_MIN_LINE and s["line"] is not None
+        if found and max(s["line"][1::2]) > SUB_MAX_HEIGHT * H:
+            found = False
         res = {"present": found, "band": spec, "where": name, "frames_with_text": s["hit"],
                "boxes_on_line": s["on_line"]}
         if found:
@@ -203,9 +207,12 @@ def check_logo(video, W, H, duration, library=None):
     elif res["pixels_loose"] > LOOSE_RATIO * res["pixels"]:
         res["warnings"].append(f"logo mask probably incomplete: {res['pixels']} pixels, a looser test finds "
                                f"{res['pixels_loose']} (dark film?)")
-    if library and (strict is None or res["warnings"]):
-        m = _library_match(ref, W, H, library)
-        if m:
+    m = _library_match(ref, W, H, library) if library else None
+    if m:
+        if not res["warnings"] and m[2] >= LIBRARY_RATIO * res["pixels"]:
+            res["warnings"].append(f"logo mask probably incomplete: {res['pixels']} pixels, the library mask for this "
+                                   f"frame size has {m[2]} (dark film?)")
+        if res["warnings"]:
             res["suggest"] = m[0]
             res["warnings"].append(f"suggesting the library mask {Path(m[0]).name} ({m[2]} pixels, contains "
                                    f"{m[1]:.0%} of the detected logo)")
