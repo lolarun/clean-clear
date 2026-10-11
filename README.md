@@ -99,6 +99,8 @@ For each video the output directory contains:
 | `--srt-only` | | extract subtitles only, do not erase |
 | `--subtitles` | `on` | `off`: the video has no hardcoded subtitles; skip OCR, SRT and subtitle erasing and only erase the watermark (avoids erasing the credits of a film that has no subtitles). Without a watermark either, nothing is written |
 | `--list FILE` | | batch file: one video per line, `"path" --option value ...`; see [Batch file](#batch-file) |
+| `--probe` | | look at each INPUT video before a batch, no erasing (a few minutes per film): hardcoded subtitles (none, one or two lines, bottom or top), logo corner and whether its mask looks complete, black letterbox bars, irregular video time stamps and audio gaps. Writes `NAME.probe.json` and `probe-batch.txt`, a `--list` file with the suggested options per video and the warnings as comments |
+| `--logo-library DIR` | | with `--probe`: folder of logo masks from earlier jobs (PNG, white = logo, the frame size of the videos they fit). When a detected logo mask looks incomplete (dark films), a library mask that contains it is suggested |
 | `--band` | `0.70,1.0` | horizontal band containing subtitles, as fractions or pixels. The default is the bottom 30% of the frame; use `0,0.3` for subtitles at the top |
 | `--device` | `auto` | `auto` / `cuda` / `cpu` / `dml` (`dml` requires onnxruntime-directml) |
 | `--crf` | `18` | output quality; lower is sharper and larger. Use `23` for a file size close to the source |
@@ -119,6 +121,16 @@ DEFAULT --crf 18
 ```
 
 The options are the ones of the command line (the call's own options apply to every video, a line overrides them). Videos run one after another, each with `--jobs auto` inside; a video that fails does not stop the others; one whose `NAME_clean.mp4` already exists in the output directory is skipped, so the same file can be run again after an interruption. At the end a summary is logged and written to `batch-status.txt`.
+
+### Checking a batch first
+
+```bash
+clean-clear --probe /data/videos -o /data/probe --logo-library /data/masks
+# read /data/probe/probe-batch.txt (WARN comments), adjust if needed, then
+clean-clear --list /data/probe/probe-batch.txt -o /data/out
+```
+
+Rules behind the suggestions: subtitles count as present when text sits on one consistent line (or two, bilingual) in at least 12 % of ~200 sampled frames; otherwise `--subtitles off`. A logo mask is flagged as incomplete when a looser detection finds 1.8x as many pixels (the dark film 2771 gave 2060 of ~6000). Time stamps are flagged when the video has 0.1 % more or fewer frames than its duration x nominal rate, and audio gaps when the audio frames hold 0.5 s less sound than the audio duration (2829: 10.8 s).
 
 ### Tuning options (rarely needed)
 

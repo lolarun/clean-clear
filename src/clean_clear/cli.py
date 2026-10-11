@@ -20,6 +20,7 @@ from .cutter import cut, parse_ranges
 from .device import gpu_compute_capability, gpu_memory_gb, onnx_providers
 from .parallel import process_parallel
 from .pipeline import process
+from .probe import probe_video, write_outputs
 from .refine import refine
 from .subtitles import OCR
 from .video import VIDEO_EXTS, pick_encoder
@@ -131,6 +132,15 @@ def build_argparser():
                     help="remove a time range (e.g. an advertisement page) from each INPUT video, frame-exact, writing "
                          "NAME_cut.mp4 (+ NAME_cut.srt); no OCR or erasing. Times as seconds, M:S or H:M:S.ms, "
                          "repeatable: --cut 0:40:01.667-0:40:46.958")
+    ap.add_argument("--probe", action="store_true",
+                    help="look at each INPUT video before a batch (subtitles: none / one / two lines, top or bottom; "
+                         "logo corner and whether its mask looks complete; letterbox; irregular time stamps and audio "
+                         "gaps) and write NAME.probe.json plus probe-batch.txt, a --list file with the suggested "
+                         "options per video; nothing is erased")
+    ap.add_argument("--logo-library", metavar="DIR",
+                    help="with --probe: folder of logo masks (PNG, white = logo, one per frame size and position) "
+                         "from earlier jobs; when a detected logo mask looks incomplete, a library mask that contains "
+                         "it is suggested instead")
     ap.add_argument("--find-ads", action="store_true",
                     help="find advertisement pages spliced into each INPUT film (full-frame pages inside a letterboxed "
                          "film, confirmed by a web address in the picture) and list them in NAME.ads.txt; nothing is "
@@ -229,6 +239,19 @@ def main(argv=None):
         sys.exit("No video files found")
     out_dir = Path(args.out)
     set_log_file(out_dir / "clean-clear.log")
+    if args.probe:
+        device, _ = onnx_providers(args.device)
+        ocr = OCR(device, fixed_shape=args.ocr_fixed_shape == "on" or (
+            args.ocr_fixed_shape == "auto" and device == "cuda" and gpu_compute_capability() >= 12.0))
+        results, failed = [], 0
+        for f in files:
+            try:
+                results.append((f, probe_video(f, ocr, args)))
+            except Exception as e:
+                failed += 1
+                log(f"!! probe failed {f}: {e}")
+        log(f"\nprobe: {len(results)}/{len(files)} video(s) -> {write_outputs(results, out_dir)}")
+        return 1 if failed else 0
     if args.find_ads or args.cut_ads:
         device, _ = onnx_providers(args.device)
         ocr = OCR(device, fixed_shape=args.ocr_fixed_shape == "on" or (
