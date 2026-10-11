@@ -7,6 +7,7 @@ import argparse
 import os
 import sys
 import time
+import traceback
 from pathlib import Path
 
 from . import backends
@@ -19,26 +20,47 @@ from .ads import find_ads, write_report
 from .cutter import cut, parse_ranges
 from .device import gpu_compute_capability, gpu_memory_gb, onnx_providers
 from .parallel import process_parallel
-from .pipeline import process
+from .pipeline import output_paths, process
 from .probe import probe_video, write_outputs
 from .refine import refine
 from .subtitles import OCR
 from .video import VIDEO_EXTS, pick_encoder
 
 
+_OUTPUT_SUFFIXES = ("_clean", "_refined")
+
+
+def is_own_output(f):
+    """Our results (`*_clean.mp4`, `*_refined.mp4`) and temporary files (hidden, `.fix`, `.tmp`)"""
+    return f.name.startswith(".") or f.stem.endswith(_OUTPUT_SUFFIXES) or f.stem.endswith((".fix", ".tmp"))
+
+
 def collect_inputs(inputs):
-    """Video files of the given files/directories. Our own `*_clean.*` outputs are skipped, so the
+    """Video files of the given files/directories. Our own outputs and temporary files are skipped, so the
     output can safely go to the input folder and reruns do not process results again."""
     files = []
     for p in map(Path, inputs):
         if p.is_dir():
             files += sorted(f for f in p.iterdir()
-                            if f.suffix.lower() in VIDEO_EXTS and not f.stem.endswith("_clean"))
+                            if f.is_file() and f.suffix.lower() in VIDEO_EXTS and not is_own_output(f))
         elif p.exists():
             files.append(p)
         else:
             log(f"Skipping missing path: {p}")
     return files
+
+
+def name_clashes(files):
+    """{file: earlier file} for inputs whose name without extension repeats (a.mp4 and a.mkv): they would write the
+    same `a_clean.mp4` / `a.srt` into the output directory"""
+    seen, out = {}, {}
+    for f in files:
+        key = f.stem.lower()  # also a clash on case-insensitive file systems (Windows)
+        if key in seen:
+            out[f] = seen[key]
+        else:
+            seen[key] = f
+    return out
 
 
 def build_argparser():
@@ -63,6 +85,8 @@ def build_argparser():
                          "one does not stop the rest, videos whose NAME_clean.mp4 already exists are skipped")
     ap.add_argument("--srt-only", action="store_true", help="extract subtitles only, do not erase")
     ap.add_argument("--no-cache", action="store_true", help="ignore the OCR cache and run OCR again")
+    ap.add_argument("--force", action="store_true",
+                    help="process videos again even if their NAME_clean.mp4 and NAME.srt already exist")
     ap.add_argument("--ocr-interval", type=int, default=10,
                     help="max frames to skip OCR while the subtitle band is unchanged (1 = OCR every frame)")
     ap.add_argument("--ocr-fixed-shape", default="auto", choices=["auto", "on", "off"],
@@ -147,6 +171,7 @@ def build_argparser():
                          "changed")
     ap.add_argument("--cut-ads", action="store_true",
                     help="like --find-ads, then cut the confirmed ads out (writes NAME_cut.mp4 and NAME_cut.srt)")
+    ap.add_argument("--split-part", action="store_true", help=argparse.SUPPRESS)  # set by --jobs for its part processes
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return ap
 
@@ -293,9 +318,18 @@ def main(argv=None):
             models.extend([ocr, backend, encoder])
         return models
 
-    out_dir = Path(args.out)
     failed = []
+    clashes = name_clashes(files)
     for f in files:
+        if f in clashes:
+            log(f"!! skipped {f}: same name as {clashes[f]}, both would write {f.stem}_clean.mp4; rename one of them")
+            failed.append(f)
+            continue
+        dst, srt, _ = output_paths(f, out_dir)
+        if not (args.force or args.srt_only or args.refine_of) and dst.exists() and (
+                srt.exists() or args.subtitles == "off"):
+            log(f"skipping {f.name}: {dst.name} already exists (--force to redo)")
+            continue
         try:
             if args.refine_of:
                 refine(f, args.refine_of, out_dir, args, *load_models())
@@ -305,6 +339,7 @@ def main(argv=None):
             process(f, out_dir, args, *load_models())
         except Exception as e:
             log(f"!! failed {f}: {e}")
+            log(traceback.format_exc().rstrip())
             failed.append(f)
     log(f"\ndone {len(files) - len(failed)}/{len(files)}")
     return 1 if failed else 0

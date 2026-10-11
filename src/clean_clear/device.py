@@ -35,10 +35,11 @@ def gpu_compute_capability():
 
 
 def gpu_memory_gb():
-    """Memory of the first NVIDIA GPU in GB, 0.0 if there is none or nvidia-smi is missing"""
+    """Memory of the smallest NVIDIA GPU in GB from nvidia-smi, 0.0 if unknown"""
     try:
         out = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-                             capture_output=True, text=True, timeout=15).stdout.split()
-        return float(out[0]) / 1024
+                             capture_output=True, text=True, timeout=15).stdout
     except Exception:
         return 0.0
+    mem = [float(l) for l in out.split() if re.fullmatch(r"\d+(\.\d+)?", l)]
+    return min(mem) / 1024 if mem else 0.0

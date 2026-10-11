@@ -52,16 +52,18 @@ It was built for a customer job: batch-process long videos on their own Windows 
 
 ### Input
 
-`clean-clear [<path> ...] [-o OUT]` or `clean-clear --list FILE [-o OUT]`, where each path is a video file or a directory; without arguments the current directory is processed and the results are written to the current directory. Directories are scanned (non-recursively) for `.mp4 .mkv .mov .avi .flv .ts .m4v .wmv .webm`, sorted by name. Files whose name ends in `_clean` (results of earlier runs) are skipped, so input and output may be the same folder. Missing paths are skipped with a log line.
+`clean-clear [<path> ...] [-o OUT]` or `clean-clear --list FILE [-o OUT]`, where each path is a video file or a directory; without arguments the current directory is processed and the results are written to the current directory. Directories are scanned (non-recursively) for `.mp4 .mkv .mov .avi .flv .ts .m4v .wmv .webm`, sorted by name. Our own results (`*_clean`, `*_refined`) and temporary files (hidden files, `*.tmp`, `*.fix`) are skipped, so input and output may be the same folder. Missing paths are skipped with a log line. Inputs that differ only in extension (`a.mp4`, `a.mkv`) would overwrite each other's results: the second one is reported as failed.
 
-### Output (in `OUT`, default `./output`)
+A video whose `<name>_clean.mp4` and `<name>.srt` already exist is skipped (`--force` reprocesses it), so a long batch can be restarted after an interruption. The video is written under a temporary name and renamed when complete.
+
+### Output (in `OUT`, default: the current directory)
 
 | File | Description |
 |---|---|
 | `<name>_clean.mp4` | H.264 video, subtitles (and optionally the watermark) removed, original audio copied |
 | `<name>.srt` | UTF-8 SRT, one entry per recognized subtitle sentence |
-| `.cache/<name>.<y0>-<y1>.ocr.json` | Raw OCR results for the subtitle band (reused on reruns) |
-| `.cache/<name>.watermark.png` | Detected watermark mask (white = watermark); all black = none found. Also useful for visual inspection |
+| `.cache/<name>.<y0>-<y1>.<key>.ocr.json` | OCR results for the subtitle band (reused on reruns; the key covers the file's size and modification time and the OCR options) |
+| `.cache/<name>.<file key>.watermark.png` | Detected watermark mask (white = watermark); all black = none found. Also useful for visual inspection |
 | `<name>.probe.json`, `probe-batch.txt` | `--probe` only: the check results per video, and a `--list` batch file with the suggested options and warnings |
 | `<name>.ads.txt` | `--find-ads` / `--cut-ads`: advertisement pages found, with start, end and status (`confirmed` or `suspect`) |
 | `<name>_cut.mp4`, `<name>_cut.srt` | `--cut` / `--cut-ads`: the video without the cut ranges; SRT cues inside them removed, later ones shifted |
@@ -81,7 +83,7 @@ The process exit code is `0` if every file succeeded and `1` if at least one fai
 | FR-4 | Subtitles shorter than `--min-dur` (default 0.4 s) are treated as noise. |
 | FR-5 | Two-line subtitles are supported and joined with a line break. A second line that is regularly present above or below the main one (bilingual subtitles) is detected from the whole video and erased together with it. |
 | FR-6 | The SRT is written even in `--srt-only` mode, without loading any inpainting model. |
-| FR-7 | Reruns on the same video and band reuse the OCR cache; `--no-cache` forces recognition again. |
+| FR-7 | Reruns on the same video and band reuse the OCR cache; `--no-cache` forces recognition again. The cache is invalidated when the file changes (size or modification time) or when `--min-score`, `--min-height` or `--ocr-interval` change. |
 
 ### 5.2 Subtitle erasing
 
@@ -91,7 +93,7 @@ The process exit code is `0` if every file succeeded and `1` if at least one fai
 | FR-9 | By default only the **glyph strokes** (plus outline and a shadow offset) are erased (`--mask glyph`); the rest of the frame keeps its original pixels. `--mask box` erases whole text boxes. Subtitles without white text fall back to boxes. |
 | FR-10 | Frames before and after each subtitle (`--pad-frames`, default 1) are erased too, to cover fade in/out. Back-to-back subtitles get the union of both masks on shared frames. |
 | FR-11 | Pixels outside the mask are never changed. |
-| FR-12 | The output has the same resolution, frame rate and frame count as the input. |
+| FR-12 | The output has the same resolution, frame rate and frame count as the input. A variable-frame-rate input is converted to a constant rate (its average), so the output keeps the input's duration and stays in sync with the audio; a warning is logged if the output video's duration differs from the source's by more than 0.5 s. |
 | FR-13 | With ProPainter, inpainting never mixes frames from different shots (shot-cut aware). |
 
 ### 5.3 Watermark removal
@@ -109,6 +111,8 @@ The process exit code is `0` if every file succeeded and `1` if at least one fai
 |---|---|
 | FR-18 | NVENC H.264 is used when available, otherwise libx264 (`--encoder` overrides). Quality is set with `--crf` (default 18). |
 | FR-19 | The audio stream is copied without re-encoding; video is `yuv420p` with `faststart`. |
+| FR-20 | Colours are preserved: video is converted with the source's own YUV matrix and range (BT.709 / BT.601 as tagged; untagged video BT.709 from 720 lines, BT.601 below) and the output is tagged accordingly. |
+| FR-21 | A `_clean.mp4` is either complete or absent: it is written under a temporary name and renamed when finished. A video whose `_clean.mp4` and `.srt` already exist is skipped unless `--force` is given, so an interrupted batch can be restarted. |
 
 ### 5.5 Films without subtitles, advertisement pages
 
@@ -142,6 +146,7 @@ clean-clear [INPUT ...] [-o OUT] [-m propainter|lama] [options]
 | `--device` | `auto` | `auto`, `cuda`, `dml`, `cpu` for OCR and LaMa (ProPainter uses CUDA if available) |
 | `--srt-only` | off | Extract subtitles only |
 | `--no-cache` | off | Ignore OCR and watermark caches |
+| `--force` | off | Process videos again even if their `_clean.mp4` and `.srt` already exist |
 | `--watermark` | `auto` | `auto`, `off`, or a mask image path |
 | `--ocr-fixed-shape` | `auto` | Feed OCR recognition a fixed input shape (workaround for multi-second stalls per new shape seen on an RTX 5090); `auto` = on for compute capability 12+ |
 | `--ocr-interval` | `10` | Max frames to skip OCR while the band is unchanged (`1` = every frame) |
@@ -156,14 +161,20 @@ clean-clear [INPUT ...] [-o OUT] [-m propainter|lama] [options]
 | `--pp-raft-iter` | `12` | Optical-flow iterations (lower = faster, less accurate) |
 | `--pp-ctx`, `--pp-pad` | `10`, `8` | Context frames per chunk side, extra frames around subtitle runs |
 | `--pp-margin` | `80` | Horizontal margin (px) around the subtitle when cropping |
+| `--pp-ref-stride` | `10` | Interval between ProPainter's global reference frames |
+| `--extend-sec` | `3` | Keep erasing up to this long before/after a subtitle while its glyphs are still visible (`0` = off) |
+| `--verify` | `on` | OCR the result again and erase any subtitle still readable |
+| `--wm-guard` | `25` | Repair watermark fills brighter than their dark surroundings by more than this (`0` = off) |
+| `--stabilize` | `0.6` | Blend filled areas with the motion-compensated previous frame against shimmer (`0` = off) |
+| `--keep-parts` | off | With `--jobs`, keep the per-part work directory |
+| `--refine-of ORIGINAL` | | Post-fix an already cleaned INPUT of ORIGINAL (residual subtitles, missed logo pixels), writing `NAME_refined.mp4` |
 | `--subtitles` | `on` | `off`: no hardcoded subtitles, only the watermark is removed |
 | `--list FILE` | | Batch file: one video per line with its own options |
 | `--probe`, `--logo-library DIR` | | Check the videos and write a batch file with suggested options; folder of known logo masks |
-| `--jobs` | `auto` | Processes per film (up to 4; one per 7 GB GPU memory and per 4 CPUs; 1 for LaMa or without a GPU) |
+| `--jobs` | `auto` | Processes per film (up to 4; one per 7 GB GPU memory and per 4 CPUs; 1 for LaMa or without a GPU); each process loads its own models: about 6.5 GB of GPU memory per process was measured for 720p films on an RTX 5090, a 1080p subtitle band needs up to ~13 GB at `--pp-chunk 120`; a warning is logged when the processes may not fit. |
 | `--mps` | `auto` | Start NVIDIA MPS for a parallel run (Linux, root) |
 | `--find-ads`, `--cut-ads` | | List / cut advertisement pages in letterboxed films |
 | `--cut START-END` | | Remove a time range, frame-exact (repeatable) |
-| `--refine-of ORIGINAL` | | Erase what is still readable in a finished result and fill missed logo pixels |
 
 `scripts/install.bat` / `scripts/install.sh` create the virtual environment and install the package in editable mode, which provides the `clean-clear` command (`python -m clean_clear` is equivalent).
 
@@ -202,7 +213,7 @@ The customer decision so far is to use **ProPainter** for delivery.
 
 ## 9. Legal and compliance notes
 
-- ProPainter (code and weights) is released under the NTU S-Lab License 1.0 for **non-commercial use only**. The customer must confirm that this is acceptable for their use; otherwise the LaMa backend (Apache-2.0) must be used.
+- ProPainter (code and weights) is released under the NTU S-Lab License 1.0 for **non-commercial use only**. The customer must confirm that this is acceptable for their use; otherwise the LaMa backend (Apache-2.0) must be used. The planned quality improvements that matter most for static shots (clean plate, inpaint-once-and-propagate; TECHNICAL §13) can be built on LaMa as well. Alternative models and their licences are surveyed in TECHNICAL §14.
 - Removing a third-party watermark or subtitles from a video may infringe rights of the content owner. The tool does not check ownership; this is the operator's responsibility.
 - Model and package licences are listed in the README.
 
@@ -240,12 +251,13 @@ Running two processes on the 5090 and splitting the batch across the customer's 
 
 ## 11. Acceptance criteria
 
-1. For each input video a `_clean.mp4` and an `.srt` are produced; resolution, frame rate, frame count and audio are unchanged.
-2. At a set of spot-checked timestamps (static dialogue shots, moving shots, back-to-back subtitles, shot cuts) no subtitle remnants, dark blobs or flicker are visible at normal playback speed.
+1. For each input video a `_clean.mp4` and an `.srt` are produced; resolution, frame rate, frame count, duration, colours and audio are unchanged (variable-frame-rate inputs: constant average rate, same duration).
+2. At a set of spot-checked timestamps (static dialogue shots, moving shots, back-to-back subtitles, shot cuts; the fixed check points are listed in TECHNICAL §9) no subtitle remnants, dark blobs or flicker are visible at normal playback speed.
 3. Running OCR on the output (`--srt-only --ocr-interval 1`) finds no subtitles (residual-text check).
 4. With `--watermark auto`, the logo is invisible in the output and the frame content around it is unchanged.
 5. Subtitle text and timing in the SRT match what is shown in the source video, apart from occasional OCR character errors.
-6. A batch with a corrupt or unsupported file completes for the other files and returns a non-zero exit code.
+6. A batch with a corrupt or unsupported file completes for the other files and returns a non-zero exit code; no partial `_clean.mp4` is left behind, and a rerun skips the finished videos.
+7. `pytest` passes (see README §Tests).
 
 ## 12. Change history (functional)
 
@@ -258,6 +270,7 @@ Running two processes on the 5090 and splitting the batch across the customer's 
 | Optional watermark removal | Customer request |
 | Defaults: ProPainter, watermark `auto`, current directory in and out | One command in the video folder |
 | Renamed to Clean Clear | Owner's decision |
+| Skip finished videos, atomic output, cache keyed by file and options, colour-exact and VFR-safe encoding (v0.3.4) | Review findings: batch restarts, stale caches, colour shift on BT.709 sources, audio drift on variable-frame-rate sources |
 | Bilingual subtitles: the second line is erased too | It was left half-erased by the grown mask of the first line |
 | Letterbox edge ignored by the logo detection | It was reported as a logo |
 | `--subtitles off`, `--list`, `--probe` | Batch of films that need different options |

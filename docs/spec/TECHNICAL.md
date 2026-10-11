@@ -1,6 +1,6 @@
 # Clean Clear — Technical Design
 
-Version 0.3.x (updated 2026-10-11). Companion document: [FUNCTIONAL.md](FUNCTIONAL.md). Defect analyses: [MEMO.md](../../MEMO.md). Roadmap: [PLANNING.md](../../PLANNING.md).
+Version 0.3.x (updated 2026-10-11). Companion document: [FUNCTIONAL.md](FUNCTIONAL.md). Defect investigations: §12. Roadmap: §13. Alternative models: §14.
 
 ## 1. Overview
 
@@ -30,7 +30,8 @@ Design principles:
 src/clean_clear/                    the package (src layout, installed with `pip install -e .`)
   __main__.py                       `python -m clean_clear`
   cli.py                            argument parsing, input discovery, model/encoder setup, per-file loop with error isolation
-  pipeline.py                       per-video orchestration (both passes), OCR loop, watermark mask resolution
+  pipeline.py                       per-video orchestration (both passes, verify), OCR loop, watermark mask resolution,
+                                    cache paths, temporary/final output paths
   parallel.py                       --jobs: split at keyframes, run part processes (MPS, restart of hung parts), merge
   probe.py                          --probe: per-video checks and the suggested batch file
   ads.py                            --find-ads: advertisement pages in letterboxed films
@@ -39,17 +40,23 @@ src/clean_clear/                    the package (src layout, installed with `pip
   rewrite.py                        partial re-encode of keyframe windows, stream copy of the rest
   stabilize.py                      flow-compensated smoothing of the filled areas
   subtitles.py                      OCR wrapper, subtitle-line detection, segmentation, SRT writer
-  masks.py                          glyph / box masks, per-frame mask assignment
+  masks.py                          MaskSet (crop-based mask storage), glyph / box masks, per-frame mask assignment
+  stabilize.py                      motion-compensated temporal smoothing of filled areas
+  rewrite.py                        re-encode only keyframe windows of a finished video, stream-copy the rest
+  refine.py                         --refine-of: post-fix an already cleaned video
+  parallel.py                       --jobs: split at keyframes, run part processes, merge video and SRT
   watermark.py                      static watermark detection
-  video.py                          ffmpeg wrappers: probe, decode, cut detection, encoder selection, threaded I/O helpers
-  device.py                         ONNX Runtime provider selection, GPU compute capability
+  video.py                          ffmpeg wrappers: probe, colour/VFR handling, decode, cut detection, encoder selection,
+                                    threaded I/O helpers, duration check
+  device.py                         ONNX Runtime provider selection, GPU compute capability and memory
   common.py                         ROOT, version, log(), Progress, usable_cpus()
   backends/__init__.py              backend interface and factory
   backends/lama.py                  LaMa (ONNX Runtime)
   backends/propainter.py            ProPainter (PyTorch)
 scripts/install.sh, install.bat     environment setup
+tests/                              pytest suite (synthetic videos, fake OCR and models; needs ffmpeg, no GPU)
 docs/spec/                          this document and FUNCTIONAL.md
-pyproject.toml                      dependencies (extra `propainter`), version, the `clean-clear` console script
+pyproject.toml                      dependencies (extras `propainter`, `test`), version, the `clean-clear` console script
 ```
 
 `ROOT` (repository root, three levels above `common.py` in a source checkout or editable install) is where `models/`, an optional `ffmpeg/` folder and the default `ProPainter/` checkout are looked up. A non-editable install would not find them, which is why the install scripts use `pip install -e .`.
@@ -71,7 +78,7 @@ Models are never committed to git; the README lists every download URL.
 
 ### 4.1 Probe and setup (`pipeline.process`)
 
-`video.probe` runs `ffprobe` and returns `(W, H, fps, n_frames)`. The frame count comes from `nb_frames`, falling back to `duration × fps`; it is therefore **approximate** and the code never relies on it being exact (see §5.5). `parse_band` converts `--band` into even-aligned pixel rows `(y0, y1)`.
+`video.probe` runs `ffprobe` and returns `(W, H, fps, n_frames)`. `fps` is the average frame rate. The frame count comes from `nb_frames`, falling back to `duration × fps`; it is therefore **approximate** and the code never relies on it being exact (see §5.5). A source whose average and nominal rates differ by more than 0.5% is treated as variable frame rate: `n = duration × fps`, and every decoder (`read_frames`, `detect_cuts`) resamples it to `fps` so that all passes share one frame numbering (§4.8a). `video.colour` returns the YUV matrix, range and output colour tags used by `read_frames` and `open_writer`. `parse_band` converts `--band` into even-aligned pixel rows `(y0, y1)`.
 
 ### 4.2 Pass 1 — OCR (`pipeline.run_ocr`)
 
@@ -79,7 +86,7 @@ Models are never committed to git; the README lists every download URL.
 - **OCR skipping.** For each frame a cheap signature is computed: the boolean map of bright, low-saturation pixels (`min > 170 and max − min < 50`) on the half-resolution band. If fewer than `max(30, 8% of reference white pixels)` pixels differ from the last OCR'd frame and fewer than `--ocr-interval` frames have passed, the previous result is reused. On the test videos OCR ran on 24–36% of frames.
 - **Recognition.** RapidOCR with `Det.limit_type=max`, `Det.limit_side_len=960` (an earlier `min` setting upscaled the band and was very slow), on the ONNX CUDA provider.
 - **First-pass filter** (`subtitles.frame_boxes`): drop boxes with score below `--min-score`, height below `max(8, H × --min-height)`, or a centre outside 15–85% of the frame width. Boxes are converted to full-frame coordinates.
-- Raw per-frame boxes are cached as JSON, keyed by video stem and band.
+- Per-frame boxes are cached as JSON (`pipeline.ocr_cache_path`), keyed by video stem, band, the file's size and modification time, and the options applied during recognition (`--min-score`, `--min-height`, `--ocr-interval`): a replaced file or changed option never reuses a stale result.
 
 ### 4.3 Subtitle-line detection and segmentation (`subtitles.py`)
 
@@ -96,7 +103,7 @@ Models are never committed to git; the README lists every download URL.
 
 - **Glyph mask** (`glyph_masks`, default). One extra decode of the band. For each frame that belongs to a segment, white pixels inside the segment's box rectangle are counted per pixel. Pixels white in **at least 50%** of the segment's frames are strokes. The stroke map is dilated with an ellipse of radius `--grow` (default 8) to cover the outline, OR-ed with a copy shifted `--shadow` px (default 3) down and right for the drop shadow, and intersected with the box dilated by the same kernel. If a segment has too few white pixels (< 3% of its box area) it falls back to the box mask.
 - **Box mask** (`box_masks`): union of a segment's OCR boxes expanded by `--dilate`.
-- **Frame assignment** (`frame_masks`): every frame from `start − pad` to `end + pad` maps to the segment. A frame covered by several segments (back-to-back subtitles) maps to a tuple key and receives the **union** of their masks. Result: `frame_seg: {frame → key}`, `masks: {key → HxW bool}`. Masks are full-frame arrays that are zero outside the band; identical keys share one array.
+- **Frame assignment** (`frame_masks`): every frame from `start − pad` to `end + pad` maps to the segment. A frame covered by several segments (back-to-back subtitles) maps to a tuple key and receives the **union** of their masks. Result: `frame_seg: {frame → key}`, `masks: {key → HxW bool}`. Masks are kept in a `MaskSet`: each mask is stored as the crop around its pixels and the full-frame (read-only) array is built on access, with the 16 most recently used arrays cached so that a backend asking for the same key on consecutive frames gets the same object. Full-frame storage, plus full-band per-pixel counts in `glyph_masks`, took ~7.6 GB per 1,500 subtitles at 1080p; crops take ~0.3 GB.
 
 ### 4.5 Shot-cut detection (`video.detect_cuts`)
 
@@ -110,7 +117,7 @@ Only computed when the backend sets `uses_cuts = True`. The video is decoded as 
 4. Black letterbox bars and 25 px of picture next to them are excluded (§4.10). Close small gaps (7×7), keep connected components of at least 20 px (and small static pieces next to them), dilate by a 15×15 ellipse (§4.9).
 5. Reject the result if it covers more than 5% of the frame.
 
-The mask is cached as `.cache/<stem>.watermark.png` (an all-black image means "none found" and prevents redetection). `--watermark <png>` bypasses detection.
+The mask is cached as `.cache/<stem>.<file key>.watermark.png` (an all-black image means "none found" and prevents redetection). `--refine-of` reads this cache to know exactly what the first pass erased (falling back to the pre-0.3.4 name, then to a re-detection with the 0.3.2 rules). `--watermark <png>` bypasses detection.
 
 Measured: 13 s per video, independent of video length, IoU 0.99 between detection on the original and on an already-cleaned video.
 
@@ -119,13 +126,13 @@ Measured: 13 s per video, independent of video length, IoU 0.99 between detectio
 ```python
 stream = prefetch(read_frames(src, W, H))                    # decode thread
 if wm is not None:
-    stream = backend.erase(stream, {i: 0 for i in range(n + 50)}, {0: wm}, cuts)   # watermark on every frame
+    stream = backend.erase(stream, all_frames(n), {0: wm}, cuts)   # watermark on every frame
 for frame in backend.erase(stream, frame_seg, masks, cuts):  # subtitles
     tw.write(frame.tobytes())                                # encode thread
 ```
 
 - The two `erase` calls are lazy generators, so the video is decoded once and encoded once; the watermark stage buffers at most one chunk, the subtitle stage another.
-- The watermark frame map deliberately covers `n + 50` frames because `n` is approximate; the ProPainter backend tolerates entries beyond the real end of the video.
+- The watermark frame map (`all_frames`) deliberately covers `n + max(250, 2% of n)` frames because `n` is approximate; the backends tolerate entries beyond the real end of the video.
 - **Why the watermark is a separate erase call.** ProPainter processes one rectangle per call. The logo (top-left) and the subtitles (bottom-centre) are far apart, so a single rectangle would span most of the frame height. Two small crops are far cheaper. They also cover different frame sets (all frames vs. ~50%).
 - **Threading (P4).** `video.prefetch` runs the ffmpeg reader in a background thread (bounded queue of 8); `video.ThreadedWriter` writes to the encoder's stdin from another thread (queue of 8) and re-raises worker errors on the next `write`/`close`. GPU inference stays on the main thread. Order is preserved because each side is a single-consumer queue.
 - **Encoding** (`video.open_writer`): raw BGR on stdin, audio copied from the source (`-map 1:a?`, `-c:a copy`), NVENC `p5` VBR with `-cq` (`--crf`) and `-b:v 0` or libx264 `medium`, `yuv420p`, `+faststart`. `pick_encoder("auto")` tests NVENC with a 0.2 s synthetic clip and falls back to libx264.
@@ -146,6 +153,16 @@ A customer spot-check of the first delivery found a subtitle left on screen and 
 **Parallel run (`--jobs N`, `parallel.py`) and post-fix (`--refine-of`, `refine.py`).** `--jobs` splits the video at keyframes into 2N parts, runs N independent Clean Clear processes pinned to disjoint CPU sets (OCR, masks, erase, verify each), takes the watermark mask from one detection on the whole film, and merges the parts (SRT time-shifted, video stream-copied, original audio). On a 16-vCPU L20 four processes reached 100 % GPU utilisation at about 19 frames/s in total (single process 12-13), so more processes do not help; 87.5 min of 720p took 2 h including OCR. `--refine-of` OCRs a finished result with the subtitle line taken from the original, erases what is still readable and fills missed logo pixels, writing one new file.
 
 Not supported by the data and therefore not changed: bridging OCR gaps inside a sentence (0 cases found), larger `--pad-frames`, and lowering `--pp-ref-stride` (no measurable effect on the flicker; it only makes the transformer step slower).
+
+### 4.8a Robustness fixes after code review (v0.3.4)
+
+- **Colours.** `video.colour()` determines the YUV matrix and range of a video (its tags; untagged: BT.709 from 720 lines, BT.601 below). `read_frames` converts with `scale=in_color_matrix=…`, `open_writer` with `out_color_matrix=…` and writes the colour tags. Before, a tagged BT.709 film was decoded as BT.709 but encoded as BT.601 without tags (a test bar moved from YCbCr 84/154/158 to 93/150/156).
+- **Variable frame rate.** `probe` flags a source whose average and nominal rates differ by more than 0.5%; `read_frames` and `detect_cuts` then resample it to the average rate (`-fps_mode cfr`), and the frame count is `duration × fps`. Before, a 6 s VFR clip came out as 9.2 s of video against 6 s of audio. `duration_check` logs a warning when an output's video length differs from the source's by more than 0.5 s.
+- **Encoder failure.** `ThreadedWriter` keeps draining its queue after a write error, so `write()`/`close()` raise instead of blocking forever when ffmpeg exits (seen as a hang with an unknown encoder; NVENC session limits or a full disk do the same).
+- **Early stop.** `prefetch` stops its thread and closes the reader when the consumer stops; `read_frames` kills its ffmpeg if closed early. A failed video no longer leaves a decoder process behind.
+- **Atomic output and restart.** `process` writes `.<name>_clean.tmp.mp4`, runs verify on it and renames it when everything succeeded; on failure it is deleted. The CLI skips videos whose `_clean.mp4` and `.srt` exist (`--force` to redo) and logs a traceback for failures.
+- **`--jobs`.** Part processes get `--split-part`: segments touching a part's first or last frames are kept even if shorter than `--min-dur` (a subtitle cut by the split was dropped and stayed on screen). `parallel.merge_cues` joins the two halves of such a subtitle into one cue. SRT offsets come from the frame counts of the cleaned parts (what the merged video is made of), the merged frame count and duration are checked, and a GPU-memory warning is logged when the processes will not fit.
+- **Watermark frame map** (`pipeline.all_frames`) reaches `n + max(250, 2% of n)`; if the video still has more frames, the run fails instead of silently leaving the logo on the last frames.
 
 ### 4.9 Third customer review (v0.3.3)
 
@@ -203,7 +220,7 @@ ONNX export `Carve/LaMa-ONNX` (`lama_fp32.onnx`), fixed 512×512 input, output i
 
 **Backend (`ProPainterBackend.erase`)** streams frames and decides *what* the engine sees:
 
-1. **Runs and chunks (`_chunks`).** Frames to erase are grouped into runs (gaps ≤ 10 frames, same shot). Each run is extended by `PAD` frames (default 8) on both sides, clamped to the shot, and split into chunks of `--pp-chunk` frames (default 120). Each chunk is processed with `CTX` (default 10) context frames on each side, also clamped to the shot. **No chunk or context ever crosses a shot cut**: ProPainter assumes one continuous shot and would otherwise propagate pixels from another shot into the hole (root cause of the dark blobs analysed in MEMO.md §1).
+1. **Runs and chunks (`_chunks`).** Frames to erase are grouped into runs (gaps ≤ 10 frames, same shot). Each run is extended by `PAD` frames (default 8) on both sides, clamped to the shot, and split into chunks of `--pp-chunk` frames (default 120). Each chunk is processed with `CTX` (default 10) context frames on each side, also clamped to the shot. **No chunk or context ever crosses a shot cut**: ProPainter assumes one continuous shot and would otherwise propagate pixels from another shot into the hole (root cause of the dark blobs analysed in §12.1).
 2. **Vertical band.** Rows are the vertical extent of all masks ± 40 px, aligned to multiples of 8 and clamped to `H // 8 × 8` (RAFT requires multiples of 8; a 714-px-tall video otherwise fails inside RAFT's correlation lookup). Minimum height 128 px (`MIN_SIDE`) so tiny regions such as a corner logo still get context.
 3. **Horizontal crop per chunk (P1).** Columns are the horizontal extent of the masks used in that chunk ± `--pp-margin` (80 px), rounded to multiples of 8, minimum width 128 px. Bands are cached full-width and cropped fresh for each chunk, so two chunks sharing a frame can use different crops. Frames are edge-padded and masks zero-padded to multiples of 8 if needed. This makes engine work proportional to text width instead of frame width.
 4. **Streaming buffer.** A dictionary holds frames not yet emitted (`buf`) and original bands still needed as chunk input (`bands`). A chunk runs as soon as its last context frame has arrived; frames before the next pending chunk are emitted immediately. If the video ends before the last chunk's context is complete, the remaining chunks run on what exists. `need` is computed up front so only required bands are copied.
@@ -218,7 +235,7 @@ Peak VRAM: about 13 GB at chunk 120 on the 1080p test clip; 7.0 / 15.6 / 20.3 GB
 | `per_frame` | `[[ (x0,y0,x1,y1,text) ]]` | one entry per frame, full-frame coordinates, JSON-cacheable |
 | `Seg` | `start, end, texts: Counter, boxes` | inclusive frame range |
 | `frame_seg` | `{int: key}` | key is an `int` (watermark) or a tuple of segment indices |
-| `masks` | `{key: H×W bool}` | full-frame arrays, shared between equal keys; treated as read-only |
+| `masks` | `MaskSet` `{key: H×W bool}` (or a plain dict for the watermark) | stored as crops; indexing returns a read-only full-frame array, the same object while it stays in the 16-entry cache |
 | `cuts` | sorted `[int]` | first frame of each new shot |
 | chunk | `(s, e, cs, ce)` | output range `s..e`, input range `cs..ce`, inclusive |
 
@@ -226,7 +243,16 @@ Invariants: output frame `i` equals input frame `i` outside the masks; the numbe
 
 ## 7. Performance model
 
-Measured on an NVIDIA A10 (24 GB), 1280×714, ProPainter, chunk 120:
+Baseline on an NVIDIA A10 (24 GB), 5-minute 1080p test clip (7515 frames, 3785 with subtitles), before the P1–P4 speed-ups:
+
+| Model | OCR | Masks | Erase + encode | Total | Peak VRAM |
+|---|---|---|---|---|---|
+| LaMa | 154 s | 22 s | 341 s | ~8.6 min | ~2 GB |
+| ProPainter (chunk 120) | 154 s | 22 s | ~30–40 min | ~35–45 min | ~13 GB |
+
+ProPainter then processed 4792 frames to erase 3785 (≈ 27 % overhead from chunk context and padding).
+
+Measured on an NVIDIA A10 (24 GB), 1280×714, ProPainter, chunk 120, current code:
 
 | Stage | 87.6 min video | Notes |
 |---|---|---|
@@ -246,7 +272,7 @@ Cost drivers and levers:
 | Resolution | decode/OCR/mask cost ≈ ×1.7–2.4 at 1080p; erase ≈ ×1.9 (estimate) | — |
 | Small crops under-fill the GPU | speed-up on faster GPUs is smaller than for large crops | run 2 processes per GPU |
 
-Implemented optimizations: horizontal crop (P1), fewer RAFT iterations (P2, 20 → 12, **quality not yet validated on a large sample**), tunable context and padding (P3, partial — flow is **not** reused across chunk overlaps), decode/inference/encode threading (P4). Remaining ideas are in PLANNING.md (clean plate for static shots, shot-wide reference frames, half-resolution mode, `torch.compile`).
+Implemented optimizations: horizontal crop (P1), fewer RAFT iterations (P2, 20 → 12, **quality not yet validated on a large sample**), tunable context and padding (P3, partial — flow is **not** reused across chunk overlaps), decode/inference/encode threading (P4). Remaining ideas are in §13 (clean plate for static shots, shot-wide reference frames, half-resolution mode, `torch.compile`).
 
 ### 7.1 Measurement on an RTX 5090 container (2026-09-28)
 
@@ -275,8 +301,10 @@ The estimate made before the run (about 1.7 h) was scaled from A10 timings with 
 | ffmpeg missing | `sys.exit` with install hint |
 | Device unavailable | `sys.exit` listing available ONNX providers |
 | ProPainter weights or checkout missing | `sys.exit` with the missing path |
-| Exception while processing one video | Logged as `!! failed`, batch continues, exit code 1 |
-| ffmpeg encoder failure / broken pipe | `RuntimeError`; encoder thread errors are re-raised in the main thread |
+| Exception while processing one video | Logged as `!! failed` with a traceback, the temporary output is deleted, batch continues, exit code 1 |
+| ffmpeg encoder failure / broken pipe | `RuntimeError` on the next `write`/`close` (the writer thread keeps draining, so nothing blocks) |
+| Two inputs with the same name, different extension | The second is reported as failed (they would share outputs) |
+| Output video shorter/longer than the source | Warning in the log |
 | Watermark mask of wrong size | `ValueError` with the expected size |
 | Watermark detection finds nothing / > 5% area | Logged, video processed without it |
 | CUDA out of memory | Not caught; lower `--pp-chunk` |
@@ -287,7 +315,7 @@ The estimate made before the run (about 1.7 h) was scaled from A10 timings with 
 
 ## 9. Testing and verification
 
-There is no automated test suite in the repository; verification so far was done as follows.
+`pytest` (see README §Tests) runs on synthetic videos with ffmpeg and fake OCR/inpainting models, no GPU needed: colour round trips (tagged BT.709, untagged HD and SD), grey level, variable frame rate, encoder failure, early stop of readers, frame-exact windows; MaskSet, union masks, glyph masks and glyph-matched extension; segmentation incl. split edges; cache keys; input filtering, name clashes, skipping finished videos; `--jobs` cue merging and child options; refine's first-pass mask; LaMa and ProPainter streaming with fake models (order, frame count, only masked pixels change, chunks never cross a cut); and `process()` end to end (SRT text and timing, subtitle erased, verify pass, failed run leaves no output, OCR cache reused). Earlier verification, still relevant for model quality:
 
 **Offline, with fakes** (no GPU, no models): chunk layout and cut clamping; streaming order and frame count with a fake engine; horizontal crop widths and pasting; chained watermark + subtitle `erase` at 1280×714 with a shot cut, asserting the engine sees dimensions divisible by 8 and that logo and subtitle pixels change only where intended; `prefetch` / `ThreadedWriter` ordering with 2000 items.
 
@@ -297,24 +325,35 @@ There is no automated test suite in the repository; verification so far was done
 |---|---|
 | 5-minute 1080p clip, full pipeline | comparison against the customer's reference output: on par for static shots |
 | Full 87.6-minute 720p film | completes, output 3.1 GB, ≈ 3.3 h |
-| 0:25 dark blobs (MEMO.md §1) | reproduced, root-caused to shot cuts, fixed and verified on a full rerun |
-| 2:56 residual text (MEMO.md §2) | fixed by union masks |
+| 0:25 dark blobs (§12.1) | reproduced, root-caused to shot cuts, fixed and verified on a full rerun |
+| 2:56 residual text (§12.2) | fixed by union masks |
 | Watermark on 5-minute clip | logo removed in five spot checks incl. static dark and textured backgrounds |
 
 **Verified on the RTX 5090 (2026-10):** a nine-film batch with mixed resolutions and codecs (AV1, H.264, mkv), each checked at 6-8 points for subtitles and logo and for picture/audio duration, one film also by shot-cut times over the whole film (§4.10).
 
-**Not yet verified:** `--probe` (written, never run); RAFT at 12 iterations across the full test set; RTX 3050 runs (VRAM at chunk 60–80); Windows end-to-end run of the ProPainter path.
+**Not yet verified:** `--probe` (written, never run); no pytest tests yet for `--list`, `--probe`, `--find-ads`, `--cut`, `--subtitles off` and the restart of hung parts; RAFT at 12 iterations across the full test set; RTX 3050 runs (VRAM at chunk 60–80); Windows end-to-end run of the ProPainter path.
 
-Suggested regression checks: the fixed timestamps listed in PLANNING.md §Validation, the residual-text OCR check on the output, and a frame-count/duration comparison between input and output.
+**Regression checks before a delivery:**
+
+- **Fixed check points** of the 5-minute test clip: 0:03, 0:20, 1:53, 2:30, 2:56, 3:20, 4:05, 4:35, compared side by side with the original, the customer's reference output and the previous version. 2:30 (static table) and 1:53 / 4:05 (moving people) are the hardest cases.
+- **Subtitle transitions**: all back-to-back subtitle changes (14 in the test clip), the source of the residual-text bug in §12.2.
+- **Residual text**: run OCR (`--srt-only --ocr-interval 1`) on the output; any subtitle found is a miss.
+- **Duration and colour**: output and source durations match (a mismatch is logged as a warning); spot-check colours on a saturated scene.
+- **Speed and VRAM**: total time and peak VRAM; VRAM must stay within 8 GB with a reduced `--pp-chunk` for RTX 3050 cards.
+- `pytest`, which does not judge inpainting quality.
 
 ## 10. Known risks and open issues
 
-- **ProPainter licence** is non-commercial; the LaMa backend is the licence-clean fallback.
-- **Approximate frame count** from ffprobe; any new code must not assume an exact `n`.
+- **ProPainter licence** is non-commercial; the LaMa backend is the licence-clean fallback (Q2 and Q6 in §13 can also be built on LaMa).
+- **VRAM:** longer reference windows (Q3) and taller bands (Q4) increase GPU memory; the chunk size must be adjusted per GPU.
+- **RTX 50 series** needs a PyTorch build with CUDA 12.8+; runs on an RTX 5090 with PyTorch 2.11 + cu128 (2026-10), where part processes occasionally hang under MPS (§12.4).
+- **Approximate frame count** from ffprobe; any new code must not assume an exact `n`. Maps that must cover every frame use `pipeline.all_frames(n)`.
+- **Outputs of 0.3.3 and earlier** are untagged and were encoded with BT.601; a partial re-encode of such a file (`--refine-of` windows) can show a slight colour difference between rewritten windows and copied pieces. Reprocess from the original if this matters.
+- **`--jobs` part boundaries:** parts are stream-copy cuts at keyframes; ProPainter context and stabilization restart at each boundary, and a subtitle across a boundary is processed as two halves (joined again in the SRT).
 - **Hung part processes** (cause unknown, see §4.10): handled by restarting, which costs up to 5 min of one process per hang.
 - **Sources with irregular time stamps or audio gaps:** check picture/audio sync of the result; never retime gapped audio.
 - **Whole-frame copies:** the watermark stage copies every frame it buffers, and the subtitle stage copies frames it edits; at 1080p this is a few MB per frame and is small next to inference, but it adds up on very fast GPUs.
-- **Chunk seams:** neighbouring chunks are solved independently (PLANNING Q5, cross-fade not implemented).
+- **Chunk seams:** neighbouring chunks are solved independently (§13 Q5, cross-fade not implemented).
 - **Very short shots** (≥ 1 frame) get the duplicate-frame fallback and little context.
 - **Detection heuristics** (subtitle line, white-glyph masks, watermark) are tuned on Chinese dialogue films with white subtitles and one opaque logo; other styles need parameter changes or manual masks.
 - **CPU-bound stages** (decode, OCR pre-processing, cut detection, mask counting) do not speed up with a faster GPU; a weak CPU on the customer's machine will limit throughput.
@@ -326,4 +365,165 @@ Suggested regression checks: the fixed timestamps listed in PLANNING.md §Valida
 - **Second watermark or moving logo:** call `erase` again in `pipeline.process` with another mask (per-frame masks are already supported by `frame_seg`).
 - **Different OCR engine:** replace `subtitles.OCR`; the rest only needs `[(box, text, score)]` per frame.
 - **Per-video parameters:** done as the `--list` batch file; `--probe` writes one. New checks go into `probe.py` and add their option to `info['options']`.
-- **Parallel processing:** run several `clean-clear` processes on disjoint folders, or several per GPU for small-crop workloads; there is no shared state except the output directory.
+- **Parallel processing:** `--jobs` for one long video, or several `clean-clear` processes on disjoint folders. Processes writing to the same output directory share `.cache/` (keys include the file fingerprint, so they do not collide) and the skip-if-finished check.
+- **Tests:** add a pytest under `tests/`; `conftest.py` has helpers for synthetic videos, and `tests/test_pipeline.py` shows how to drive `process()` with a fake OCR and backend.
+
+## 12. Defect investigations
+
+Notes kept for their method and data. Test clip: `燕赤霞传之情迷兰若寺.mp4`, 1920×1080, 25 fps, 7515 frames; investigated 2026-09-24.
+
+### 12.1 Dark, flickering blobs at ~0:25 (ProPainter)
+
+**Symptom.** Around 0:24–0:27 (subtitle "能杀我的妖 还没出生呢", frames 621–685) the ProPainter output showed dark, irregular blobs with straight edges where the subtitle had been. Their shape changed every frame, so they read as flicker. The LaMa output of the same frames was clean.
+
+**Experiments.** Each one re-ran ProPainter on this subtitle only (band rows 816–1024 unless noted) and compared frames 630 / 640 / 650.
+
+| # | Hypothesis | Experiment | Result |
+|---|---|---|---|
+| 1 | fp16 overflow / precision | same chunk (frames 590–700) in fp16 vs fp32 | identical blobs → rejected |
+| 2 | black letterbox dragged into the fill (bar starts at row 975) | band 816–968, letterbox excluded | blobs remain, different shape → rejected |
+| 3 | subtitle shadow not covered by the mask | overlay of the glyph mask on frame 640 | mask fully covers glyphs and shadow → rejected |
+| 4 | mask too small | glyph mask grow 14 / shadow 6, and full box mask | blobs get **larger**, dark red → the fill copies content from elsewhere |
+| 5 | too little context for flow completion | taller bands: 208 / 464 / 624 px, frames 605–675 | **all clean, including the 208 px reference** → the frame range matters, not the band height |
+| 6 | a specific frame range is the source | frames 590–675 vs 605–700, band 208 px | 590–675 clean, 605–700 blobs → source is in frames 676–700 |
+
+Side result of #5: peak VRAM grows with band height (7.0 / 15.6 / 20.3 GB for 71 frames at 208 / 464 / 624 px).
+
+**Root cause.** Frame-difference analysis found shot cuts at frames 607, 666 and 695, so the subtitle spans three shots: 607–665 a foggy wide shot (where the blobs appear), 666–694 a close-up with a large dark robe exactly where the subtitle is, 695– a red-robe close-up. ProPainter treats every frame of a chunk as one continuous shot and propagates pixels between them along the completed optical flow. The chunk crossed the cuts, so dark robe pixels from the close-ups were copied into the masked area of the foggy shot, whose low texture gives almost no reliable flow of its own. The more frames of the other shots a chunk contains, the worse it gets, which matches experiments 5 and 6.
+
+**Fix.** Shot cut detection (§4.5) and cut-aware chunking (§5.3): a plain difference threshold found 345 "cuts" in the 5-minute clip (fire, flashes, fast motion in the intro), the spike rule 123 (5–8 per 30 s in the dialogue part, keeping 607 / 666 / 695), in ~11 s. Result on the clip: 75 chunks (was 58), none crossing a cut, all subtitle frames covered, 5293 frames processed (was 4792). One-frame shots are handled by duplicating the frame. Verified offline (cut positions, chunk layout, streaming order with a fake engine) and with a full ProPainter run on the A10: 123 cuts in 16 s, erase + encode 2139 s, the blobs at 25.2 / 25.6 / 26.0 / 26.4 s gone, check points 1:53, 2:30, 2:56 and 4:05 unchanged.
+
+### 12.2 Subtitle left unerased at 2:56 (fixed in `ec57a9e`)
+
+**Symptom.** At 2:56 most of "比如说我们有一个新产品" stayed visible in the ProPainter output; only the middle part was erased.
+
+**Root cause.** The erased part matched the previous subtitle "你看" (two centred characters). With `--pad-frames 1`, frame 4399 belonged both to the padding of "你看" and to the start of the new subtitle but only received the earlier subtitle's mask. The new subtitle was unmasked on that frame: LaMa left a one-frame flash, and ProPainter treated the text as real background and propagated it into the following frames. 14 of 99 subtitle transitions in the clip are back to back.
+
+**Fix.** `masks.frame_masks` gives such frames the union of all covering subtitles' masks (§4.4). The delivered file was repaired by re-running only the 11 affected chunks and compositing them onto the original.
+
+### 12.3 Picture up to 1.5 s late against the audio (RTX 5090 batch, 2026-10)
+
+**Symptom.** Film 2829 (1280x708, 91 min, logo only): the picture ran behind the sound, more and more over the film. Shot cuts in the result against the source: -0.05 s at 5 min, +0.21 s at 25 min, +0.45 s at 45 min, +0.72 s at 65 min, +0.95 s at 85 min; the video stream ended 1.52 s after the audio. The other films of the batch ended 0.27-0.36 s late; the one with a clean 25 fps source (2838) was exact.
+
+**Experiments.**
+
+| # | Hypothesis | Experiment | Result |
+|---|---|---|---|
+| 1 | decoded at the nominal 25 fps, encoded at the average 24.9475 | decode with `-r` = the writer's rate | identical result (136,103 frames, same drift) → rejected, change reverted |
+| 2 | the parts | split the film into the same 16 parts, decode each, compare frames with duration × fps | every part yields ~1.7 frames more than duration × fps (e.g. 8501 for 340.68 s at 24.9478) → confirmed |
+
+**Root cause.** The parts are cut with `-c copy`; their header keeps the film's average rate 24.9478 although their content runs at ~25 fps, and the constant-rate decode adds about 2 repeated frames at the end of each part. 16 parts × ~0.07 s = 1.1-1.5 s.
+
+**Fix.** `pipeline.process` decodes at most `n = round(duration × fps)` frames. The rerun of 2829 has its shot cuts within 0.03-0.1 s of the source over the whole film. The finished films were corrected without re-encoding by scaling the video time stamps to the audio length (`-itsscale audio/video`). Two films gave equal DTS that way (1-tick frame durations at part joins); for one of them the audio was stretched with `atempo` instead. That was wrong for 2829: its audio holds 10.8 s less sound than its time line (gaps), and `atempo` closes the gaps, moving the sound by up to 10 s. Caught by the audio duration dropping from 5454 s to 5444 s; reverted, and the film was re-run instead.
+
+### 12.4 Part processes that hang (RTX 5090, MPS)
+
+**Symptom.** A part of a parallel run stopped writing 8 s after its start and stayed alive for 2 h, using no CPU, with 932 MB on the GPU; the film waited for it. Later: 2 of 16 parts of the next film, 1 of 16 of the one after, and 2 of 16 of a later film after the start had been staggered.
+
+**What is known.** The last log line was always in the start-up: right after loading the OCR models, or at the first OCR call. The main thread slept (`hrtimer_nanosleep`), the other threads and the ffmpeg child waited on futexes. No error in the MPS logs, no OOM, no kernel message. All hung parts had started at the same time as other parts under MPS; starting parts 20 s apart did not stop the hangs. `py-spy` could not read the process (no ptrace permission in the container).
+
+**Fix (workaround).** The parent restarts a part that printed no progress line 5 min after its start or wrote nothing for 15 min, at most twice (§4.10). Cost per hang: up to 5 min of one process. The cause is open.
+
+### 12.5 Logo only partly erased in a dark film (2771)
+
+**Symptom.** "190" of the "1905电影网" logo stayed visible; only the right part of the logo was erased.
+
+**Root cause.** The mask covered 2060 pixels (x 86-148); the same logo gives ~6000 pixels in the other films. The logo is semi-transparent; in a dark film its colour follows the background, so few pixels stay within the colour tolerance in 85 % of the samples.
+
+**Fix.** The film was re-run logo-only over the result, with the mask of another film of the same frame size and logo position. `--probe` now repeats the detection with a looser consistency (0.6) and warns when that finds 1.8× as many pixels; `--logo-library` suggests a stored mask that contains the detected one.
+
+### 12.6 Lessons
+
+- Video inpainting must never mix shots: detect cuts before planning chunks.
+- Any frame that is not masked is ground truth for ProPainter and can be propagated far; masking errors that are invisible with LaMa (one frame) become obvious with ProPainter.
+- Reproduce on a short range first, then bisect the frame range; that located the source quickly after the parameter-based hypotheses failed.
+- Check picture/audio sync over the whole result, not only the total duration: compare shot-cut times of source and result at the start, middle and end. A drift that grows with the number of parts points at the part boundaries.
+- Prove a fix by its effect before shipping it: the first sync fix produced a byte-identical result.
+- Never retime audio without checking that it has no gaps (audio frames × frame size / sample rate against its duration).
+- A CUDA process started next to an MPS server gets no GPU and runs on the CPU without an error.
+- Verify every logo mask on dark scenes; a short mask is the sign (compare with other films of the same source).
+
+## 13. Roadmap
+
+Effort estimates are rough; expected gains are untested unless marked done.
+
+### 13.1 Quality
+
+Smearing appears where the background behind the subtitle has to be invented rather than copied from another frame. Background visible anywhere in the same shot can be restored almost perfectly; background covered for the whole shot can only be made plausible and temporally stable. Causes:
+
+1. **Short temporal reach**: each chunk sees only ~5 s (120 frames + 10 context frames per side); background exposed earlier or later in the shot is never used.
+2. **Wrong completed flow**: flow inside the mask is completed by the model, and its errors drag pixels along (the classic smear). The band is only ~40 px taller than the text on each side, which gives RAFT little context.
+3. **Chunks crossing shot cuts**: fixed by Q1 (§12.1).
+4. **Chunk seams**: neighbouring chunks are solved independently, so results can jump at chunk boundaries.
+5. **Never-exposed regions**: the transformer hallucinates them per frame window; results are soft and may drift between windows (partly mitigated by `stabilize`, §4.9).
+
+| # | Item | Fixes | Effort | Status |
+|---|---|---|---|---|
+| Q1 | Shot detection; chunks never cross a cut | 3 | 0.5 d | ✅ done, verified on the test clip |
+| Q2 | **Clean plate for static shots**: per shot, estimate camera motion; if static, fill every masked pixel from the nearest frame of the shot where it is unmasked (temporal median of unmasked observations) | 1, 2 for static shots | 1 d | P0, open |
+| Q3 | **Shot-wide reference frames**: pick ProPainter's non-local references from the whole shot, preferring frames where the masked area is exposed | 1 | 0.5–1 d | P1, open |
+| Q4 | **Taller band** for flow estimation, pasting back only masked pixels. At 0:25: VRAM 7.0 → 15.6 → 20.3 GB for 208 → 464 → 624 px, no visible gain once the shot-cut problem was fixed | 2 | 0.25 d | P2, open |
+| Q5 | **Overlapping chunks with cross-fade** of the overlapping frames | 4 | 0.5 d | P2, open |
+| Q6 | **Inpaint once, propagate**: for pixels never exposed in a shot, inpaint one keyframe (LaMa or a diffusion model such as DiffuEraser) and propagate it along the completed flow | 5 | 1–2 d | P2, open |
+
+Q1 + Q2 are expected to remove most visible smearing: static dialogue shots are the most common and most noticeable case. Q2 also saves time, because pixels filled from a clean plate need no network inference.
+
+### 13.2 Performance
+
+| # | Item | Expected gain | Effort | Status |
+|---|---|---|---|---|
+| P1 | Horizontal crop around the subtitle (§5.3) | ~2× | 0.25 d | ✅ done |
+| P2 | Fewer RAFT iterations (20 → 12); flow is ~30–40 % of the time | 20–30 % | 0.1 d | ✅ done; quality not yet validated on a large sample |
+| P3 | Less redundant work: smaller context/padding, reuse flow of overlapping context frames | 15–20 % | 0.5 d | ⚠️ partial: `--pp-ctx` / `--pp-pad` are tunable; flow reuse across chunks needs an engine refactor to cache flow between calls |
+| P4 | Decode, inference and encode in separate threads | 10–20 % | 0.5 d | ✅ done (`prefetch`, `ThreadedWriter`) |
+| P5 | Half-resolution mode (optional): inpaint the band at 0.5×, upscale only the inpainted pixels | 2–4× | 0.5 d | P2, open; trades sharpness |
+| P6 | Batch small chunks; `torch.compile` / TensorRT for the inpainting network | 10–30 % | 1 d | P3, open |
+
+Also done since: `--jobs` with optional NVIDIA MPS (§4.8, §4.9).
+
+### 13.3 Suggested order
+
+1. **Q2**: biggest remaining visible quality gain.
+2. **Q3, P3** (flow reuse).
+3. **Q4, Q5, Q6, P5, P6**: only if still needed.
+
+For batches: B1 (run `--probe` on the nine known films), then B3 and B5 (§13.4).
+
+### 13.4 Large batches (2026-10)
+
+Customers send many films that each need a decision (subtitles or not, one or two lines, logo corner,
+faulty sources). For the first eight films that decision was made by looking at frames (one model
+agent per film). Plan:
+
+| # | Item | Status |
+|---|---|---|
+| B1 | `--probe`: subtitles, logo corner, logo mask sanity, letterbox, time stamps and audio gaps; writes a `--list` batch file with the options and warnings | written, **not yet run**; check its verdicts on the nine known films (expected: 2754/2840 one line; 2762/2771/2838/1080p film two lines; 2785/2795/2829 none; 2771 incomplete logo mask; 2829 irregular time stamps and 10.8 s audio gaps; 2838 interlaced flag; 1080p film letterbox, no logo) |
+| B2 | Logo mask library from finished jobs (`--logo-library`) | done with B1 |
+| B3 | Result QA with a vision model: per film ~20 before/after crops (subtitle band, logo corner, dark scenes), structured answer (subtitle left, logo left, scene text erased, smear, with times); only flagged films go to a person. Run through the Message Batches API (half price). The Anthropic API is not reachable from mainland China directly: needs a relay outside or a machine that is | planned; first test on the eight finished films, which have two known defects (2771 logo, a "FUJITSU" screen erased in 2840) |
+| B4 | Inserted advertisements in films without letterbox: new fixed logo, web address / phone number / QR code anywhere in the frame, format jumps; frames sampled per shot instead of every 20 s; a vision model reads overview sheets as the last check | postponed (owner's decision 2026-10-11); `--find-ads` / `--cut` stay as they are |
+| B5 | Picture/audio sync check of every result (stream durations, shot-cut times source vs result) as part of the batch | open; done by hand so far |
+
+## 14. Alternative inpainting models (survey, 2026-09-28)
+
+Desk research only; none of these has been run on our clips. Speeds and memory are from the papers / READMEs.
+
+| Model | Type | Quality | Cost | Availability / licence |
+|---|---|---|---|---|
+| **ProPainter** (current, ICCV 2023) | RAFT flow + flow completion + propagation and sparse transformer; no diffusion | very good when the background is exposed elsewhere in the shot, no hallucination risk; soft where it never is; fast motion smears | ≈ 13 fps overall on an A10 for a 720p film (subtitle crop only, measured); ≈ 13 GB at chunk 120, fits 8 GB at chunk 60–80 | open source, NTU S-Lab 1.0, **non-commercial** |
+| **DiffuEraser** (2025) | diffusion (SD-based) refining a ProPainter prior | sharper in never-exposed areas | much slower; runs ProPainter first anyway | Apache-2.0, bundled ProPainter parts keep ProPainter's licence |
+| **MiniMax-Remover** (2025) | video diffusion, 6 steps, general object removal | strong on objects | ≈ 3.4 fps at 480p on an A800, ≈ 14 GB; 1080p much more | open source. **Dropped**: trained on object masks, works at 480×832 (thin strokes get lost) and still needs our masks |
+| **EraserDiT** (2025) | diffusion transformer video inpainting | reported good | "fast" for a diffusion method | paper |
+| **SEDiT** (Baidu, arXiv 2605.14894, May 2026) | subtitle-specific, **mask-free**, one-step DiT on LTX-Video-2B + LoRA | vs MiniMax-Remover on VSR-Bench-400: PSNR 31.59 vs 28.31, FVD 24.06 vs 39.35, MOS 4.5 vs 2.5 | 1080p, 65 frames in ≈ 4 s on an A800 80 GB (≈ 16 fps); likely > 24 GB at 1080p full frame | project page only, **no code or weights** (checked 2026-09-28); © Baidu. Contact: Zheng Hui (zheng_hui@aliyun.com), Yunlong Bai (baiyunlong@baidu.com) |
+| **CLEAR** (ICML 2026, arXiv 2603.21901) | subtitle-specific, **mask-free**, LoRA (rank 64) on Wan2.1-Fun-1.3B, 5 steps, 81-frame sliding window | +6.77 dB PSNR, −74.7 % VFID vs ProPainter / DiffuEraser / MiniMax-Remover on Chinese subtitles | ≈ 4.86 s per frame, ≈ 1,000 GPU-days for 200 h of video | code and weights released, Apache-2.0, but the model card says **research purposes only** |
+
+**Not applicable:** NVIDIA DLSS 5 (game frames with engine motion vectors, no SDK for arbitrary video, does not reconstruct occluded content); RTX Video Super Resolution / HDR and Maxine Video Effects (no inpainting). TensorRT is an accelerator for ProPainter, not a model (P6).
+
+**Using CLEAR for experiments.** Install [Wan2.1](https://github.com/Wan-Video/Wan2.1) and [DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio) (torch ≥ 2.4), the Wan2.1 1.3B base model and the LoRA checkpoint `CLEAR-mask-free-subtitle-removal.pt`, then `python inference.py --model_base_path <Wan2.1-Fun-V1.1-1.3B-Control> --lora_checkpoint ./checkpoints/CLEAR-mask-free-subtitle-removal.pt --lora_rank 64 --input_video input.mp4 --output_dir ./results --num_steps 5 --cfg_scale 1.0 --use_sliding_window` (window 81 frames, overlap 16: `--chunk_size`, `--chunk_overlap`). The README downloads `Wan2.1-T2V-1.3B` but the command points at `Wan2.1-Fun-V1.1-1.3B-Control`; check which base model is required.
+
+**Decision.**
+- Keep **ProPainter**. Our masks are small, the videos are long, and the total volume (≈ 200 h) is throughput-bound; the diffusion models cost several times more compute per frame.
+- **Watch SEDiT**: subtitle-specific, mask-free (our OCR filter and glyph masks are the weakest parts) and fast at 1080p. If it is released, benchmark it on the fixed check points (§9); it would replace masking and erasing, while OCR would still produce the SRT.
+- **CLEAR** is too slow for 200 h and research-only; use it at most as a quality reference on a few shots.
+- Speed should come from P6 and Q2 rather than from a model change.
+
+Sources: [ProPainter](https://github.com/sczhou/ProPainter), [DiffuEraser](https://github.com/lixiaowen-xw/diffueraser), [MiniMax-Remover](https://arxiv.org/pdf/2505.24873), [EraserDiT](https://arxiv.org/html/2506.12853v2), [SEDiT](https://arxiv.org/abs/2605.14894) ([project](https://zheng222.github.io/SEDiT_project/)), [CLEAR](https://arxiv.org/abs/2603.21901) ([code](https://github.com/silent-commit/CLEAR), [weights](https://huggingface.co/charlesw09/CLEAR-mask-free-video-subtitle-removal)), [DLSS 5](https://research.nvidia.com/labs/adlr/DLSS5/).

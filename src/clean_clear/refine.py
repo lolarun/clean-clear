@@ -7,6 +7,7 @@ import subprocess
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from .common import fmt_time, log
@@ -33,6 +34,21 @@ def estimate_line(src, W, H, band, ocr, args, duration, samples=300):
     return subtitle_line(per_frame)
 
 
+def first_pass_watermark(original, dirs, H, W):
+    """The watermark mask the first pass really erased, from its cache in one of `dirs` (an all-black mask: none was
+    erased); None if no cache is found. Detecting it again with today's code would also return the pieces that only
+    newer versions find, and refine would then re-fill (and blur) pixels that were already clean."""
+    from .pipeline import watermark_cache_path
+    for d in dirs:
+        for p in (watermark_cache_path(d, original), Path(d) / ".cache" / f"{original.stem}.watermark.png"):
+            if p.exists():
+                m = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+                if m is not None and m.shape == (H, W):
+                    log(f"  first-pass watermark mask: {p}")
+                    return m > 127
+    return None
+
+
 def refine(cleaned, original, out_dir, args, ocr, backend, encoder):
     cleaned, original = Path(cleaned), Path(original)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -47,9 +63,12 @@ def refine(cleaned, original, out_dir, args, ocr, backend, encoder):
 
     extra = None
     if args.watermark == "auto":  # logo pieces the first pass did not erase
-        old = watermark.detect(original, W, H, n / fps, near_small=False)  # exactly what the first pass erased
+        old = first_pass_watermark(original, [out_dir, cleaned.parent], H, W)
+        if old is None:
+            log("  no watermark cache of the first pass found; assuming it erased what version 0.3.2 detected")
+            old = watermark.detect(original, W, H, n / fps, near_small=False)
         new = watermark.detect(original, W, H, n / fps)
-        if old is not None and new is not None:
+        if old is not None and old.any() and new is not None:
             extra = new.copy()
             acc = watermark.leftover_accents(original, W, H, n / fps, new)
             if acc is not None:
@@ -81,29 +100,38 @@ def refine(cleaned, original, out_dir, args, ocr, backend, encoder):
     if extra is None and not plain_timeline(cleaned):
         log("  input has hidden pre-roll frames (stream-copy cut): re-encoding the whole file instead of windows")
         extra = np.zeros((H, W), bool)  # take the full pass below; an empty fill mask changes nothing
-    if extra is None:  # only subtitles to fix: re-encode just the windows around them, copy the rest
+    tmp = out_dir / f".{dst.stem}.tmp.mp4"  # renamed to dst only when complete
+    try:
+        if extra is None:  # only subtitles to fix: re-encode just the windows around them, copy the rest
 
-        def fix(frames, a, b):
-            fs = {i - a: k for i, k in frame_seg.items() if a <= i < b}
-            cw = [c - a for c in cuts if a < c < b]
-            return stabilize(backend.erase(frames, fs, masks, cw), fs, masks, cw, args.stabilize, label="refine")
+            def fix(frames, a, b):
+                fs = {i - a: k for i, k in frame_seg.items() if a <= i < b}
+                cw = [c - a for c in cuts if a < c < b]
+                return stabilize(backend.erase(frames, fs, masks, cw), fs, masks, cw, args.stabilize, label="refine")
 
-        rewrite(cleaned, original, dst, [(min(r), max(r)) for r in _runs(frame_seg)], fix, encoder, args.crf)
-    else:  # logo pixels change on every frame: one full pass
-        wr = open_writer(original, dst, W, H, fps, encoder, args.crf)  # audio from the original
-        tw = ThreadedWriter(wr)
-        try:
-            stream = prefetch(read_frames(cleaned, W, H))
-            if extra.any():
-                stream = watermark.spatial_fill(stream, extra)
-            if frame_seg:
-                stream = stabilize(backend.erase(stream, frame_seg, masks, cuts), frame_seg, masks, cuts,
-                                   args.stabilize, label="refine")
-            for frame in stream:
-                tw.write(np.ascontiguousarray(frame).tobytes())
-        finally:
-            tw.close()
-        if wr.returncode != 0:
-            raise RuntimeError(f"ffmpeg encoding failed (code {wr.returncode})")
+            rewrite(cleaned, original, tmp, [(min(r), max(r)) for r in _runs(frame_seg)], fix, encoder, args.crf)
+        else:  # logo pixels change on every frame: one full pass
+            wr = open_writer(original, tmp, W, H, fps, encoder, args.crf)  # audio from the original
+            tw = ThreadedWriter(wr)
+            stream = None
+            try:
+                stream = prefetch(read_frames(cleaned, W, H))
+                if extra.any():
+                    stream = watermark.spatial_fill(stream, extra)
+                if frame_seg:
+                    stream = stabilize(backend.erase(stream, frame_seg, masks, cuts), frame_seg, masks, cuts,
+                                       args.stabilize, label="refine")
+                for frame in stream:
+                    tw.write(np.ascontiguousarray(frame).tobytes())
+            finally:
+                if stream is not None:
+                    stream.close()
+                tw.close()
+            if wr.returncode != 0:
+                raise RuntimeError(f"ffmpeg encoding failed (code {wr.returncode})")
+        tmp.replace(dst)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     log(f"  refined video -> {dst}  ({time.time() - t0:.0f}s)")
     return dst
