@@ -1,6 +1,6 @@
 # Clean Clear — Technical Design
 
-Version 0.3.x. Companion document: [FUNCTIONAL.md](FUNCTIONAL.md). Defect analyses: [MEMO.md](../../MEMO.md). Roadmap: [PLANNING.md](../../PLANNING.md).
+Version 0.3.x (updated 2026-10-11). Companion document: [FUNCTIONAL.md](FUNCTIONAL.md). Defect analyses: [MEMO.md](../../MEMO.md). Roadmap: [PLANNING.md](../../PLANNING.md).
 
 ## 1. Overview
 
@@ -31,6 +31,13 @@ src/clean_clear/                    the package (src layout, installed with `pip
   __main__.py                       `python -m clean_clear`
   cli.py                            argument parsing, input discovery, model/encoder setup, per-file loop with error isolation
   pipeline.py                       per-video orchestration (both passes), OCR loop, watermark mask resolution
+  parallel.py                       --jobs: split at keyframes, run part processes (MPS, restart of hung parts), merge
+  probe.py                          --probe: per-video checks and the suggested batch file
+  ads.py                            --find-ads: advertisement pages in letterboxed films
+  cutter.py                         --cut: frame-exact removal of time ranges
+  refine.py                         --refine-of: post-fix of a finished result
+  rewrite.py                        partial re-encode of keyframe windows, stream copy of the rest
+  stabilize.py                      flow-compensated smoothing of the filled areas
   subtitles.py                      OCR wrapper, subtitle-line detection, segmentation, SRT writer
   masks.py                          glyph / box masks, per-frame mask assignment
   watermark.py                      static watermark detection
@@ -53,9 +60,9 @@ pyproject.toml                      dependencies (extra `propainter`), version, 
 |---|---|---|
 | ffmpeg / ffprobe | decode, encode, probing | on PATH or in `ROOT/ffmpeg`; NVENC optional |
 | onnxruntime-gpu 1.22+ | OCR and LaMa | `ort.preload_dlls()` loads the pip-installed CUDA/cuDNN |
-| RapidOCR 3.4+ | text detection and recognition | PP-OCRv6 small det + rec models; the direction classifier is disabled (`use_cls=False`) |
+| RapidOCR 3.4+ (3.10 loads models lazily, handled) | text detection and recognition | PP-OCRv6 small det + rec models; the direction classifier is disabled (`use_cls=False`) |
 | OpenCV, NumPy | mask morphology, image ops | headless OpenCV |
-| PyTorch (CUDA) | ProPainter only | torch 2.14 + cu130 on the test server |
+| PyTorch (CUDA) | ProPainter only | torch 2.14 + cu130 on the A10/L20 servers, 2.11 + cu128 on the RTX 5090 |
 | ProPainter checkout + 3 weight files | ProPainter only | `RAFT`, `RecurrentFlowCompleteNet`, `InpaintGenerator`; not part of this repository |
 
 Models are never committed to git; the README lists every download URL.
@@ -77,7 +84,7 @@ Models are never committed to git; the README lists every download URL.
 ### 4.3 Subtitle-line detection and segmentation (`subtitles.py`)
 
 1. **Subtitle line** (`subtitle_line`): histogram of all box y-centres in 4 px bins; the mode is the line position, the median height of boxes within 8 px of the mode is the text height. This uses the whole video, so recurring subtitle rows dominate over scene text.
-2. **Line filter** (`filter_line`): keep boxes whose height is 0.75–1.33× the text height and whose centre is between `mode − 2.5h` and `mode + 0.5h`. A box above the main line is only accepted if it lies **entirely above** the main line (boxes overlapping the line vertically are scene content — this removed costume text being read as a second subtitle line).
+2. **Line filter** (`filter_line`): keep boxes whose height is 0.75–1.6× the text height (a second, bilingual line is matched against its own position and height, see §4.10) and whose centre is between `mode − 2.5h` and `mode + 0.5h`. A box above the main line is only accepted if it lies **entirely above** the main line (boxes overlapping the line vertically are scene content — this removed costume text being read as a second subtitle line).
 3. **Text joining** (`join_text`): boxes are grouped into lines by y-centre proximity, sorted left to right, joined with spaces and newlines.
 4. **Segmentation** (`build_segments`), two stages:
    - consecutive frames with identical text (spaces ignored, gaps up to `--max-gap`) form *runs*;
@@ -100,7 +107,7 @@ Only computed when the backend sets `uses_cuts = True`. The video is decoded as 
 1. Grab 150 full frames evenly spaced between 3% and 97% of the duration (one `ffmpeg -ss` per sample, four parallel workers).
 2. For each corner window (`min(W/3, 480) × min(H/4, 200)`), compute the per-pixel median colour of the stack.
 3. A pixel is a watermark candidate if its colour stays within ±14 of the median in more than 85% of samples **and** the median image has an edge there (morphological gradient > 25, dilated) — this excludes flat regions such as black bars or uniformly dark scenes.
-4. Close small gaps (7×7), keep connected components of at least 20 px, dilate by a 9×9 ellipse for anti-aliased edges.
+4. Black letterbox bars and 25 px of picture next to them are excluded (§4.10). Close small gaps (7×7), keep connected components of at least 20 px (and small static pieces next to them), dilate by a 15×15 ellipse (§4.9).
 5. Reject the result if it covers more than 5% of the frame.
 
 The mask is cached as `.cache/<stem>.watermark.png` (an all-black image means "none found" and prevents redetection). `--watermark <png>` bypasses detection.
@@ -152,6 +159,23 @@ Not supported by the data and therefore not changed: bridging OCR gaps inside a 
 - **Measured on the full film (L20, 16 vCPU, `--jobs 4`, 2 h 8 min):** luma -0.05..+0.03 against the source at five points; erased-area steadiness (result/source frame-to-frame change) 0.99 at 51:48 (was 1.35), 1.21 at 45:05; 54:30 and 54:41 stay at 2.4-2.7: fast motion through the subtitle area and a short shot where the background under the text is never revealed, so the model guesses it anew every frame. The cut at 54:41 was detected; the dark smear there is that guess, not content from the previous shot. Verify windows re-encoded 250-1000 frames per part instead of whole parts; the file is 2.74 GB instead of 3.08 GB.
 - **NVIDIA MPS** (concurrent kernels from several processes; 90 s clips, other jobs were running on the machine at the same time, so the numbers are indicative): 4 processes 491 s without MPS, 420 s with MPS (-14 %, GPU power 256 -> 294 W); 8 processes with MPS were slower per clip than 4; `--pp-chunk 240` with MPS was 7 % slower than 120. GPU memory peaked at 15.5 GB with 4 processes and 30 GB with 8.
 - Audio/video sync is fine: the source has 17 one-frame gaps (0.72 s in total) and the result is constant-rate, which puts the picture at most 41 ms off the audio.
+
+### 4.10 Batch of eight films on an RTX 5090 (2026-10)
+
+Eight 84-97 min films (1280x544 to 1280x720, two AV1, one logo per film in a top corner, three without hardcoded subtitles) and one 110 min 1080p mkv with bilingual subtitles and a spliced-in advertisement page. What they exposed, and the changes:
+
+- **Bilingual subtitles.** Only the most frequent line (Chinese) was a subtitle; the English line below it failed the position test, and the grown mask of the Chinese line erased its upper half (garbled text). `subtitles.subtitle_line` now also returns a second line when another peak within 2.5 text heights holds at least 30 % as many boxes as the main line; `filter_line` keeps boxes on either line.
+- **Letterbox edge taken for a logo.** The picture's edge against a black bar never changes, so the static-colour test found it (x 0-1919). `watermark._bar_zone` removes black rows/columns of each corner crop and 25 px of picture next to them from the candidates.
+- **rapidocr >= 3.10** loads its models lazily; `text_rec` is `None` until first use, which broke the fixed-shape wrapper. `OCR` loads it explicitly.
+- **Films without subtitles** (`--subtitles off`): OCR, SRT, masks and verify are skipped; the subtitle erase stage is not chained when there is nothing to erase.
+- **Batch file** (`--list`, `cli.run_list`): each line becomes a `main()` call with the line's options after the call's own options (`DEFAULT` first), so the last value wins as in argparse. A video is skipped when `<stem>_clean.mp4` exists; `batch-status.txt` summarises.
+- **Parallel runs** (`parallel.py`): `--jobs auto` = min(4, GPU GB / 7, usable CPUs / 4). Parts are 4 per process (was 2): with 2 the credits part took 73 min against 46-56 for the others and 3 of 4 processes idled for 29 min. The last part starts first, parts start 20 s apart, and part processes always get `--jobs 1`.
+- **MPS** (`parallel.start_mps`): with more than one process on Linux as root, `nvidia-cuda-mps-control -d` is started with `/tmp/nvidia-mps` and its environment is passed to the parts; `quit` afterwards. A CUDA process started outside MPS while the server ran got no GPU and computed on the CPU (0.3 frames/s), so extra work goes into the batch, not next to it.
+- **Hung parts.** A part process stayed alive and idle right after loading its models (3 of ~35 parts; once for 2 h, holding up the whole film). The parent kills the part's process group (parts run in their own session) and starts it again when it printed no progress line 5 min after its start or wrote nothing for 15 min, at most twice. `py-spy` dumps go to `hang_dumps/`; inside this container ptrace was not permitted. The last log line of the hung parts was in the CUDA/ONNX start-up (model loading, first OCR call) and all of them had started together with other parts under MPS, hence the staggered start; that did not stop the hangs (two more in the next film), so the cause is still open.
+- **Picture late against the audio.** One film (2829: nominal 25 fps, average 24.9475, 274 frames missing from its time line) ended 1.5 s late, growing steadily (shot cuts 0.2 s late at 25 min, 0.95 s at 85 min); the others 0.3 s at the end. A part cut with `-c copy` keeps the film's stale average frame rate in its header; decoding it at that rate yields about 2 repeated frames at its end, and 16 parts add up. Decoding at the writer's rate explicitly changed nothing (reverted). The decode now stops after `n = round(duration x fps)` frames (`pipeline.process`). Rerun of 2829: shot cuts within 0.03-0.1 s of the source over the whole film. Finished films were corrected without re-encoding by scaling the video time stamps to the audio length (`-itsscale`); where that produced equal DTS (the parts' 1-tick durations), the audio was stretched with `atempo` instead, which is only safe when the audio has no gaps: 2829's audio holds 10.8 s less sound than its time line, and `atempo` shifted the sound by up to 10 s.
+- **Dark film, incomplete logo mask.** In 2771 the strict test found 2060 of ~6000 logo pixels (the semi-transparent logo changes colour with dark backgrounds), so "190" stayed visible. A mask from another film with the same frame size and logo fixed it in a second, logo-only pass over the result. `--probe` repeats the detection with `consistency=0.6` and warns when that finds 1.8x as many pixels; `--logo-library` suggests a known mask that contains the detected one.
+- **Advertisement page** (the 1080p film, 45 s at 40:01): `ads.find_ads` measures the letterbox from per-row darkness over 1 frame per second, takes runs of frames with picture in the bars (>= 10 s, gaps <= 3 s), refines both ends frame-exact (allowing for the stream's start time; the mkv started at 0.023 s and the first estimate was one frame late), and confirms a run by a web address in 8 OCR'd frames. `cutter.cut` re-encodes only the keyframe windows around the cut, removes the same range from the audio with `aselect` and shifts the SRT.
+- **`--probe`** (`probe.py`): subtitles from OCR of 200 frames in the bottom and then the top band (present when >= 12 % of the samples have text on the detected line(s) and >= 50 % of all boxes sit on them), the logo checks above, letterbox, and time stamps (video frames vs duration x nominal rate, 0.1 % tolerance; audio frames x frame size / sample rate vs audio duration, 0.5 s tolerance; start offset; field order). **Not yet run**: the thresholds still have to be checked on the nine films above.
 
 ## 5. Backends
 
@@ -257,6 +281,9 @@ The estimate made before the run (about 1.7 h) was scaled from A10 timings with 
 | Watermark detection finds nothing / > 5% area | Logged, video processed without it |
 | CUDA out of memory | Not caught; lower `--pp-chunk` |
 | Video ends earlier than `nb_frames` | Handled: trailing chunks run on available frames |
+| Part process of a parallel run hangs | Killed with its process group and restarted (no progress 5 min after start, or no output for 15 min), at most twice, then the film fails |
+| `--probe` fails on one video | Logged as `!! probe failed`, the other videos are probed, exit code 1 |
+| `--cut` on a source not starting at time 0 | Refused with a hint to cut the `_clean.mp4` result |
 
 ## 9. Testing and verification
 
@@ -274,7 +301,9 @@ There is no automated test suite in the repository; verification so far was done
 | 2:56 residual text (MEMO.md §2) | fixed by union masks |
 | Watermark on 5-minute clip | logo removed in five spot checks incl. static dark and textured backgrounds |
 
-**Not yet verified:** RAFT at 12 iterations across the full test set; 1080p timings; RTX 3050 and RTX 5090 runs (VRAM at chunk 60–80, PyTorch build for Blackwell); Windows end-to-end run of the ProPainter path; multi-video batches with mixed resolutions.
+**Verified on the RTX 5090 (2026-10):** a nine-film batch with mixed resolutions and codecs (AV1, H.264, mkv), each checked at 6-8 points for subtitles and logo and for picture/audio duration, one film also by shot-cut times over the whole film (§4.10).
+
+**Not yet verified:** `--probe` (written, never run); RAFT at 12 iterations across the full test set; RTX 3050 runs (VRAM at chunk 60–80); Windows end-to-end run of the ProPainter path.
 
 Suggested regression checks: the fixed timestamps listed in PLANNING.md §Validation, the residual-text OCR check on the output, and a frame-count/duration comparison between input and output.
 
@@ -282,6 +311,8 @@ Suggested regression checks: the fixed timestamps listed in PLANNING.md §Valida
 
 - **ProPainter licence** is non-commercial; the LaMa backend is the licence-clean fallback.
 - **Approximate frame count** from ffprobe; any new code must not assume an exact `n`.
+- **Hung part processes** (cause unknown, see §4.10): handled by restarting, which costs up to 5 min of one process per hang.
+- **Sources with irregular time stamps or audio gaps:** check picture/audio sync of the result; never retime gapped audio.
 - **Whole-frame copies:** the watermark stage copies every frame it buffers, and the subtitle stage copies frames it edits; at 1080p this is a few MB per frame and is small next to inference, but it adds up on very fast GPUs.
 - **Chunk seams:** neighbouring chunks are solved independently (PLANNING Q5, cross-fade not implemented).
 - **Very short shots** (≥ 1 frame) get the duplicate-frame fallback and little context.
@@ -294,5 +325,5 @@ Suggested regression checks: the fixed timestamps listed in PLANNING.md §Valida
 - **New inpainting model:** add `backends/<name>.py` with a class implementing `erase(frames, frame_seg, masks, cuts=())`, set `uses_cuts` if it is temporal, register it in `backends.MODELS` and `create()`.
 - **Second watermark or moving logo:** call `erase` again in `pipeline.process` with another mask (per-frame masks are already supported by `frame_seg`).
 - **Different OCR engine:** replace `subtitles.OCR`; the rest only needs `[(box, text, score)]` per frame.
-- **Per-video parameters:** `pipeline.process(src, out_dir, args, ...)` reads everything from `args`, so a config-file layer can be added in `cli.py`.
+- **Per-video parameters:** done as the `--list` batch file; `--probe` writes one. New checks go into `probe.py` and add their option to `info['options']`.
 - **Parallel processing:** run several `clean-clear` processes on disjoint folders, or several per GPU for small-crop workloads; there is no shared state except the output directory.

@@ -1,6 +1,6 @@
 # Clean Clear — Functional Design
 
-Version 0.3.x. Companion document: [TECHNICAL.md](TECHNICAL.md).
+Version 0.3.x (updated 2026-10-11). Companion document: [TECHNICAL.md](TECHNICAL.md).
 
 ## 1. Purpose
 
@@ -19,7 +19,7 @@ It was built for a customer job: batch-process long videos on their own Windows 
 |---|---|
 | User | An operator who runs the tool on a folder and reviews the output. No programming knowledge is required. |
 | OS | Windows 10/11, Linux (tested on Ubuntu 22.04) |
-| GPU | NVIDIA, 4 GB+ VRAM for OCR and LaMa; 8 GB+ for ProPainter (with a reduced chunk size); RTX 50 series needs a CUDA 12.8+ driver and PyTorch build (not yet tested) |
+| GPU | NVIDIA, 4 GB+ VRAM for OCR and LaMa; 8 GB+ for ProPainter (with a reduced chunk size); RTX 50 series needs a CUDA 12.8+ driver and PyTorch build (tested on an RTX 5090 with PyTorch 2.11 + cu128) |
 | Software | Python 3.10–3.13, ffmpeg/ffprobe, ONNX Runtime GPU, PyTorch (ProPainter only) |
 | Network | Only needed once, to download models and packages. Processing is fully offline. |
 
@@ -27,10 +27,14 @@ It was built for a customer job: batch-process long videos on their own Windows 
 
 ### In scope
 
-- Batch processing of every video in one or more folders (or individual files).
-- Subtitle recognition (Chinese and other text supported by PP-OCR) and export to SRT.
+- Batch processing of every video in one or more folders (or individual files), or of a batch file that gives each video its own options (`--list`).
+- A check of every video before a batch (`--probe`) that suggests those options.
+- Subtitle recognition (Chinese and other text supported by PP-OCR) and export to SRT; one-line and two-line (bilingual, e.g. Chinese above English) subtitles.
 - Subtitle erasing with two selectable inpainting models: **LaMa** (fast, single-image) and **ProPainter** (slower, uses neighbouring frames, better on moving shots).
+- Films without hardcoded subtitles: only the watermark is removed (`--subtitles off`).
 - Optional static watermark removal (`--watermark`), detected automatically or supplied as a mask image.
+- Advertisement pages spliced into a letterboxed film: found and listed (`--find-ads`), cut out on request (`--cut-ads`, or any time range with `--cut`).
+- Long films are processed by several processes at once on one GPU (`--jobs`, default `auto`).
 - Audio is preserved bit-exact (stream copy).
 - Restart-friendly caching of the expensive OCR and watermark-detection results.
 
@@ -39,7 +43,8 @@ It was built for a customer job: batch-process long videos on their own Windows 
 - Soft subtitles (separate subtitle tracks) — they can simply be dropped with ffmpeg.
 - Translation, subtitle styling, re-burning subtitles.
 - Moving, animated or semi-transparent watermarks (see §8).
-- Subtitles at arbitrary positions in the same video (one subtitle line position per video is assumed).
+- Subtitles at arbitrary positions in the same video (one subtitle line position, or one pair of lines for bilingual subtitles, per video is assumed).
+- Finding advertisement pages in films without letterbox bars.
 - A graphical user interface.
 - Commercial use of the ProPainter model (see §9).
 
@@ -47,7 +52,7 @@ It was built for a customer job: batch-process long videos on their own Windows 
 
 ### Input
 
-`clean-clear [<path> ...] [-o OUT]`, where each path is a video file or a directory; without arguments the current directory is processed and the results are written to the current directory. Directories are scanned (non-recursively) for `.mp4 .mkv .mov .avi .flv .ts .m4v .wmv .webm`, sorted by name. Files whose name ends in `_clean` (results of earlier runs) are skipped, so input and output may be the same folder. Missing paths are skipped with a log line.
+`clean-clear [<path> ...] [-o OUT]` or `clean-clear --list FILE [-o OUT]`, where each path is a video file or a directory; without arguments the current directory is processed and the results are written to the current directory. Directories are scanned (non-recursively) for `.mp4 .mkv .mov .avi .flv .ts .m4v .wmv .webm`, sorted by name. Files whose name ends in `_clean` (results of earlier runs) are skipped, so input and output may be the same folder. Missing paths are skipped with a log line.
 
 ### Output (in `OUT`, default `./output`)
 
@@ -57,6 +62,10 @@ It was built for a customer job: batch-process long videos on their own Windows 
 | `<name>.srt` | UTF-8 SRT, one entry per recognized subtitle sentence |
 | `.cache/<name>.<y0>-<y1>.ocr.json` | Raw OCR results for the subtitle band (reused on reruns) |
 | `.cache/<name>.watermark.png` | Detected watermark mask (white = watermark); all black = none found. Also useful for visual inspection |
+| `<name>.probe.json`, `probe-batch.txt` | `--probe` only: the check results per video, and a `--list` batch file with the suggested options and warnings |
+| `<name>.ads.txt` | `--find-ads` / `--cut-ads`: advertisement pages found, with start, end and status (`confirmed` or `suspect`) |
+| `<name>_cut.mp4`, `<name>_cut.srt` | `--cut` / `--cut-ads`: the video without the cut ranges; SRT cues inside them removed, later ones shifted |
+| `batch-status.txt` | `--list`: one line per video with its status (`ok`, `FAILED`, `skipped`) and elapsed time |
 
 The process exit code is `0` if every file succeeded and `1` if at least one failed. A failure in one file is logged (`!! failed <file>: <reason>`) and does not stop the batch.
 
@@ -70,7 +79,7 @@ The process exit code is `0` if every file succeeded and `1` if at least one fai
 | FR-2 | The subtitle line position and text height are inferred from the whole video, so that scene text (signs, calligraphy, credits, logos, costume patterns) is **not** treated as a subtitle. |
 | FR-3 | Frames with the same or very similar text are merged into one subtitle with start and end time. OCR jitter is tolerated (`--max-gap`); two long, clearly different sentences stay separate even if similar. |
 | FR-4 | Subtitles shorter than `--min-dur` (default 0.4 s) are treated as noise. |
-| FR-5 | Two-line subtitles are supported and joined with a line break. |
+| FR-5 | Two-line subtitles are supported and joined with a line break. A second line that is regularly present above or below the main one (bilingual subtitles) is detected from the whole video and erased together with it. |
 | FR-6 | The SRT is written even in `--srt-only` mode, without loading any inpainting model. |
 | FR-7 | Reruns on the same video and band reuse the OCR cache; `--no-cache` forces recognition again. |
 
@@ -92,7 +101,7 @@ The process exit code is `0` if every file succeeded and `1` if at least one fai
 | FR-14 | `--watermark off` leaves the watermark untouched; the default is `auto`. |
 | FR-15 | `--watermark auto` finds a static, opaque logo in the four corners by sampling frames across the video, and removes it on every frame. The mask is saved to `.cache` for inspection. |
 | FR-16 | `--watermark <mask.png>` uses a user-supplied mask instead (must have the video's exact size; white = watermark). This is the manual override when detection is wrong. |
-| FR-17 | If nothing is found, or the detected area is unreasonably large (> 5% of the frame), the video is processed without watermark removal and a log line says so. |
+| FR-17 | If nothing is found, or the detected area is unreasonably large (> 5% of the frame), the video is processed without watermark removal and a log line says so. The edge of a black letterbox bar is never taken for a logo. |
 
 ### 5.4 Encoding
 
@@ -100,6 +109,23 @@ The process exit code is `0` if every file succeeded and `1` if at least one fai
 |---|---|
 | FR-18 | NVENC H.264 is used when available, otherwise libx264 (`--encoder` overrides). Quality is set with `--crf` (default 18). |
 | FR-19 | The audio stream is copied without re-encoding; video is `yuv420p` with `faststart`. |
+
+### 5.5 Films without subtitles, advertisement pages
+
+| ID | Requirement |
+|---|---|
+| FR-20 | `--subtitles off` skips OCR, SRT and subtitle erasing and only removes the watermark; credits and scene text stay untouched. Without a watermark either, nothing is written and the log says so. |
+| FR-21 | `--find-ads` lists full-frame pages inside a letterboxed film (picture in the black bars for at least 10 s); a page whose picture contains a web address is `confirmed`, the others are `suspect`. Nothing is changed. Films without letterbox bars cannot be checked this way and the log says so. |
+| FR-22 | `--cut START-END` (repeatable) removes time ranges frame-exact; only keyframe windows around the cuts are re-encoded, the audio and the SRT follow. `--cut-ads` cuts the `confirmed` pages. Sources whose first frame is not at time 0 (typical for mkv) are refused; cut the `_clean.mp4` result instead. |
+
+### 5.6 Batches
+
+| ID | Requirement |
+|---|---|
+| FR-23 | `--list FILE` runs one video per line with the options of that line (a `DEFAULT` line applies to all; options as on the command line). Videos run one after another; a failed video does not stop the rest; a video whose `_clean.mp4` exists in the output directory is skipped, so an interrupted batch can be started again. |
+| FR-24 | `--probe` checks each video without erasing and writes the suggested options: subtitles (none, one or two lines, bottom or top band), logo corner and whether its mask looks complete (with `--logo-library`, a known mask that contains the detected one is suggested), letterbox bars, irregular video time stamps, audio gaps, interlaced flag. Warnings go into the batch file as comments. |
+| FR-25 | Long films are split into parts that run in up to 4 processes (`--jobs auto`); the result is identical in content to a single-process run. A part that hangs is restarted automatically. |
+| FR-26 | The result's picture stays in sync with the audio over the whole film (at most a few frames off), also for sources with irregular time stamps. |
 
 ## 6. Command-line interface
 
@@ -130,6 +156,14 @@ clean-clear [INPUT ...] [-o OUT] [-m propainter|lama] [options]
 | `--pp-raft-iter` | `12` | Optical-flow iterations (lower = faster, less accurate) |
 | `--pp-ctx`, `--pp-pad` | `10`, `8` | Context frames per chunk side, extra frames around subtitle runs |
 | `--pp-margin` | `80` | Horizontal margin (px) around the subtitle when cropping |
+| `--subtitles` | `on` | `off`: no hardcoded subtitles, only the watermark is removed |
+| `--list FILE` | | Batch file: one video per line with its own options |
+| `--probe`, `--logo-library DIR` | | Check the videos and write a batch file with suggested options; folder of known logo masks |
+| `--jobs` | `auto` | Processes per film (up to 4; one per 7 GB GPU memory and per 4 CPUs; 1 for LaMa or without a GPU) |
+| `--mps` | `auto` | Start NVIDIA MPS for a parallel run (Linux, root) |
+| `--find-ads`, `--cut-ads` | | List / cut advertisement pages in letterboxed films |
+| `--cut START-END` | | Remove a time range, frame-exact (repeatable) |
+| `--refine-of ORIGINAL` | | Erase what is still readable in a finished result and fill missed logo pixels |
 
 `scripts/install.bat` / `scripts/install.sh` create the virtual environment and install the package in editable mode, which provides the `clean-clear` command (`python -m clean_clear` is equivalent).
 
@@ -159,7 +193,12 @@ The customer decision so far is to use **ProPainter** for delivery.
 - **One subtitle position per video.** Subtitles that move between top and bottom are only handled if `--band` covers both, and scene text in that band may be mistaken for subtitles.
 - **Subtitle colour:** the tight glyph mask relies on white text; other colours fall back to text boxes (blurrier fill).
 - **OCR accuracy** is not guaranteed; SRT text may contain recognition errors and should be proofread.
-- Detection results and quality on 1080p, on the 3050 and on the 5090 have **not been measured** (see §10).
+- **Detection results** were checked on eight 720p films and one 1080p film on an RTX 5090 (2026-10); 3050 and Windows runs of the ProPainter path are not measured (see §10).
+- **Dark films:** the logo detector can find only part of a semi-transparent logo (one film: 2060 of ~6000 pixels), leaving the rest visible. `--probe` warns about it; a known mask (`--logo-library`, `--watermark <mask.png>`) fixes it.
+- **Scene text on the subtitle line** (e.g. a brand name on a screen behind the subtitles) can be erased together with the subtitles.
+- **Logo over structured background:** where the logo covers detailed content (calligraphy, window lattices), the fill can blur or remove part of it.
+- **Sources with gaps in the audio time line** keep their gaps (silence) in the result; their audio must never be retimed.
+- **Advertisement pages** are only found in letterboxed films and only confirmed by a web address in the picture.
 
 ## 9. Legal and compliance notes
 
@@ -181,6 +220,15 @@ Measured on an NVIDIA A10 (24 GB), 1280×714 25 fps, ProPainter, current code:
 
 Watermark removal on a 5-minute 1280×714 clip: detection 13 s, plus about 291 s of additional erase time (≈ 39 ms per frame, ≈ 1 h per hour of video on an A10).
 
+Measured on an RTX 5090 (32 GB, 16-core CPU quota, libx264, `--jobs 4` with MPS), 2026-10:
+
+| Film | Wall time |
+|---|---|
+| 110 min 1080p, Chinese + English subtitles, no logo (8 parts) | 2 h 9 min |
+| 84-97 min 720p, subtitles + logo (16 parts) | 78-91 min (one film 2 h, including a 30 min hang before hung parts were restarted automatically) |
+| 84-91 min 720p, logo only (`--subtitles off`) | 37-54 min |
+
+A single process uses about 31 % of this GPU while erasing; with 4 processes it is mostly busy, and the 16-core quota becomes the limit.
 Planning estimate for 200 hours (300 videos) of **1080p** video on one RTX 5090, derived from the numbers above (not measured on that hardware or resolution):
 
 | Scope | Estimate |
@@ -210,3 +258,9 @@ Running two processes on the 5090 and splitting the batch across the customer's 
 | Optional watermark removal | Customer request |
 | Defaults: ProPainter, watermark `auto`, current directory in and out | One command in the video folder |
 | Renamed to Clean Clear | Owner's decision |
+| Bilingual subtitles: the second line is erased too | It was left half-erased by the grown mask of the first line |
+| Letterbox edge ignored by the logo detection | It was reported as a logo |
+| `--subtitles off`, `--list`, `--probe` | Batch of films that need different options |
+| `--find-ads`, `--cut-ads`, `--cut` | A casino advertisement page spliced into a film |
+| `--jobs auto`, 4 parts per process, MPS started automatically, hung parts restarted | Faster batches on one GPU; one part hung for 2 h |
+| Frame count capped per part | The picture of a film with irregular time stamps ended 1.5 s late against the audio |

@@ -186,18 +186,11 @@ Test clip: 1920×1080, 25 fps, 5 minutes, ~100 subtitles.
 
 On a big machine one process leaves most of it idle, so long videos run faster with `--jobs`. Measured on an NVIDIA L20 (16 vCPU, 46 GB) with a 90-minute 720p film: 4 processes finished in 2 h 8 min, a single process took over 3 h. More than 4 processes did not help, because the GPU is then the limit.
 
-Several processes on one GPU take turns by default: their kernels never run at the same time, and the small crops Clean Clear works on leave much of the GPU unused (utilisation shows ~100 %, power stays at ~65 %). NVIDIA's Multi-Process Service (MPS) lets them run concurrently. Clean Clear does not start it, because it is a machine-wide service that needs root and affects every CUDA program on that GPU. To use it on Linux:
+Several processes on one GPU take turns by default: their kernels never run at the same time, and the small crops Clean Clear works on leave much of the GPU unused (utilisation shows ~100 %, power stays at ~65 %). NVIDIA's Multi-Process Service (MPS) lets them run concurrently. With more than one process on Linux as root, Clean Clear starts the MPS daemon for the run and stops it afterwards (`--mps auto`, the default; `--mps off` never starts it; an MPS daemon that is already running, `CUDA_MPS_PIPE_DIRECTORY` set, is used as is).
 
-```bash
-# start MPS (as root), then run as usual
-export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-log
-mkdir -p $CUDA_MPS_PIPE_DIRECTORY $CUDA_MPS_LOG_DIRECTORY
-nvidia-cuda-mps-control -d
-clean-clear /data/videos -o /data/output --jobs 4
+While the MPS server holds the GPU, a CUDA process started outside it gets no GPU and silently runs on the CPU. Do not start a second `clean-clear` next to a running parallel run; put the work into the batch file instead.
 
-# stop MPS afterwards
-echo quit | nvidia-cuda-mps-control
-```
+A part process occasionally hangs right after loading its models (seen on an RTX 5090 under MPS); the parent restarts it, see below.
 
 Measured on the same L20 with 90-second clips (other work was running on the machine at the time, so treat the numbers as indicative):
 

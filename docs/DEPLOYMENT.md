@@ -70,23 +70,52 @@ The inputs are video files or directories (any path), `-o` is the output directo
 .venv/bin/clean-clear /data/videos/film.mkv -o /data/out --propainter-dir /opt/ProPainter
 ```
 
-For a long video start it detached, write to a log, and look at the progress lines (`[ocr] ...`, `[erase] ... ETA`):
+### A batch of films
+
+Films differ (no subtitles, bilingual subtitles, a logo in another corner, irregular time stamps), so check them first and give each its own options:
+
+```bash
+# 1. probe: a few minutes per film, nothing is erased; writes NAME.probe.json and probe-batch.txt
+.venv/bin/clean-clear --probe /data/videos -o /data/probe --logo-library /data/masks
+# 2. read the WARN comments in /data/probe/probe-batch.txt, adjust options if needed
+# 3. run the batch file (one film after another, 4 processes per film, finished films are skipped)
+.venv/bin/clean-clear --list /data/probe/probe-batch.txt -o /data/out --propainter-dir /opt/ProPainter
+```
+
+Keep the logo masks of finished jobs (`.cache/NAME.watermark.png` once checked) in the library folder: they are suggested when a new film's logo mask looks incomplete (dark films).
+
+### Detached runs
+
+Start long runs detached, write to a log, and read the progress lines (`[ocr] ...`, `[erase] ... ETA`, `part k/16 done`):
 
 ```bash
 cat > run.sh <<'EOS'
 #!/bin/bash
 date +%s > /data/out/start.epoch
-/opt/clean-clear/.venv/bin/clean-clear /data/videos/film.mkv -o /data/out --propainter-dir /opt/ProPainter --jobs 4 > /data/out/run.log 2>&1
+/opt/clean-clear/.venv/bin/clean-clear --list /data/probe/probe-batch.txt -o /data/out --propainter-dir /opt/ProPainter > /data/out/run.log 2>&1
+echo "EXIT=$?" >> /data/out/run.log
 date +%s > /data/out/end.epoch
 EOS
 chmod +x run.sh && setsid nohup ./run.sh > /dev/null 2>&1 < /dev/null &
 tail -f /data/out/run.log
 ```
 
-## 5. Parallel runs and MPS
+The batch file is read once when the run starts. To change it for the remaining films, wait until the run has just started the next film, stop it (the parent `clean-clear --list` first, then the part processes) and start it again: finished films are skipped, and only the minute or two of the film that had just started is lost.
 
-`--jobs N` splits a long video into 2N parts and runs N processes at once (one process leaves most of a big GPU idle). With `--jobs` greater than 1 on Linux as root, Clean Clear starts the NVIDIA MPS daemon itself for the run and stops it afterwards (`--mps auto`, the default; `--mps off` disables it; if MPS cannot start the run simply continues without it). If you already run MPS (`CUDA_MPS_PIPE_DIRECTORY` set), it is used as is. MPS made 4 processes about 14 % faster on an L20; see "Parallel runs and NVIDIA MPS" in the README.
+## 5. Parallel runs, MPS and hung parts
 
-## 6. Before releasing the server
+- `--jobs auto` (the default) starts up to 4 processes per film: one per 7 GB of GPU memory and per 4 usable CPUs (the container's CPU quota counts, not the host's core count). A film is split at keyframes into 4 parts per process; the last part (the dense credits) starts first, and parts start 20 s apart.
+- With more than one process on Linux as root, the NVIDIA MPS daemon is started for the run and stopped afterwards (`--mps auto`; `--mps off` disables it). While the MPS server holds the GPU, **a CUDA process started outside it gets no GPU** and silently runs on the CPU (seen: 0.3 frames/s instead of 15). Never start a second `clean-clear` next to a running batch; put the extra work into the batch file instead.
+- A part process sometimes hangs right after loading its models (3 of ~35 parts on an RTX 5090 under MPS; it stays alive, idle, for hours). The parent kills and restarts a part that has printed no progress line 5 min after its start or no output for 15 min, at most twice. `py-spy` (if installed) saves the hung stack, but in containers without ptrace permission it cannot read the process.
+- Measured on an RTX 5090 (32 GB, 16-core quota): a 110-min 1080p film 2 h 9 min; 84-97 min 720p films 78-89 min with subtitles, 37-54 min with the logo only.
 
-Copy the `*_clean.mp4`, `*.srt` and `clean-clear.log` files out (`scp`, then compare checksums), and keep the `.cache/` folder if a customer may ask for a re-run with other settings.
+## 6. Checking the results
+
+- **Picture and audio in sync.** Compare the video and audio stream durations of every result (`ffprobe -show_entries stream=codec_type,duration`); more than ~0.3 s apart needs a closer look. For a precise check, compare the times of a few shot cuts (`select='gt(scene,0.35)',showinfo` with `-copyts`) in the source and in the result at the start, middle and end of the film.
+- **Never retime audio that has gaps.** Some sources hold less sound than their time line (2829: 10.8 s of gaps); `--probe` warns about it. `atempo` closes the gaps and moves the sound against the picture. Fix the video instead, or re-run the film.
+- Logo and subtitles: look at before/after crops at 6-8 points spread over the film, including dark scenes (a logo mask can be incomplete there).
+
+## 7. Before releasing the server
+
+- Copy the `*_clean.mp4`, `*.srt` and `clean-clear.log` files out (`scp`, then compare sizes or checksums), and keep the `.cache/` folder if a re-run with other settings may be needed.
+- Trial jobs for a customer without a signed contract: leave only the code on the server (`src/`, `pyproject.toml`, `scripts/`), no project documents (README, MEMO, PLANNING, `docs/`), and the results stay on the server until the customer decides.

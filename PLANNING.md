@@ -122,6 +122,20 @@ The newer models win on sharpness of never-exposed areas and on not needing mask
 
 Sources: [ProPainter](https://github.com/sczhou/ProPainter), [DiffuEraser](https://github.com/lixiaowen-xw/diffueraser), [MiniMax-Remover](https://arxiv.org/pdf/2505.24873), [EraserDiT](https://arxiv.org/html/2506.12853v2), [SEDiT](https://arxiv.org/abs/2605.14894) ([project](https://zheng222.github.io/SEDiT_project/)), [CLEAR](https://arxiv.org/abs/2603.21901) ([code](https://github.com/silent-commit/CLEAR), [weights](https://huggingface.co/charlesw09/CLEAR-mask-free-video-subtitle-removal)), [DLSS 5 (NVIDIA ADLR)](https://research.nvidia.com/labs/adlr/DLSS5/).
 
+## Large batches (2026-10)
+
+Customers send many films that each need a decision (subtitles or not, one or two lines, logo corner,
+faulty sources). For the first eight films that decision was made by looking at frames (one model
+agent per film). Plan:
+
+| # | Item | Status |
+|---|---|---|
+| B1 | `--probe`: subtitles, logo corner, logo mask sanity, letterbox, time stamps and audio gaps; writes a `--list` batch file with the options and warnings | written, **not yet run**; check its verdicts on the nine known films (expected: 2754/2840 one line; 2762/2771/2838/1080p film two lines; 2785/2795/2829 none; 2771 incomplete logo mask; 2829 irregular time stamps and 10.8 s audio gaps; 2838 interlaced flag; 1080p film letterbox, no logo) |
+| B2 | Logo mask library from finished jobs (`--logo-library`) | done with B1 |
+| B3 | Result QA with a vision model: per film ~20 before/after crops (subtitle band, logo corner, dark scenes), structured answer (subtitle left, logo left, scene text erased, smear, with times); only flagged films go to a person. Run through the Message Batches API (half price). The Anthropic API is not reachable from mainland China directly: needs a relay outside or a machine that is | planned; first test on the eight finished films, which have two known defects (2771 logo, a "FUJITSU" screen erased in 2840) |
+| B4 | Inserted advertisements in films without letterbox: new fixed logo, web address / phone number / QR code anywhere in the frame, format jumps; frames sampled per shot instead of every 20 s; a vision model reads overview sheets as the last check | postponed (owner's decision 2026-10-11); `--find-ads` / `--cut` stay as they are |
+| B5 | Picture/audio sync check of every result (stream durations, shot-cut times source vs result) as part of the batch | open; done by hand so far |
+
 ## Suggested order
 
 1. **P1, P2** – quick wins, make every later experiment cheaper
@@ -140,4 +154,4 @@ Sources: [ProPainter](https://github.com/sczhou/ProPainter), [DiffuEraser](https
 
 - **License**: ProPainter (NTU S-Lab License 1.0) is non-commercial only. For commercial delivery, Q2 and Q6 (with LaMa) can also be built on the LaMa backend, which is Apache-2.0.
 - **VRAM**: longer reference windows (Q3) and taller bands (Q4) increase memory; chunk size must be adjusted per GPU.
-- **RTX 50 series**: requires a PyTorch build with CUDA 12.8+; not yet tested.
+- **RTX 50 series**: requires a PyTorch build with CUDA 12.8+; runs on an RTX 5090 with PyTorch 2.11 + cu128 (2026-10). Part processes occasionally hang there under MPS (MEMO.md §4).

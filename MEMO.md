@@ -1,7 +1,8 @@
-# Memo: ProPainter defect analysis
+# Memo: defect analyses
 
-Investigation notes for defects found in the ProPainter output of the test clip
-(`燕赤霞传之情迷兰若寺.mp4`, 1920×1080, 25 fps, 7515 frames). Dates are 2026-09-24.
+Investigation notes. Sections 1-2: defects found in the ProPainter output of the test clip
+(`燕赤霞传之情迷兰若寺.mp4`, 1920×1080, 25 fps, 7515 frames), 2026-09-24. Sections 3-5: a batch of
+eight 720p films on an RTX 5090, 2026-10.
 
 ---
 
@@ -90,6 +91,84 @@ original (`*_clean_pp_fixed.mp4`).
 
 ---
 
+## 3. Picture up to 1.5 s late against the audio (RTX 5090 batch, 2026-10)
+
+### Symptom
+
+Film 2829 (1280x708, 91 min, logo only): the picture ran behind the sound, more and more over the
+film. Shot cuts in the result against the source: -0.05 s at 5 min, +0.21 s at 25 min, +0.45 s at
+45 min, +0.72 s at 65 min, +0.95 s at 85 min; the video stream ended 1.52 s after the audio. The
+other films of the batch ended 0.27-0.36 s late; the one with a clean 25 fps source (2838) was exact.
+
+### Hypotheses and experiments
+
+| # | Hypothesis | Experiment | Result |
+|---|---|---|---|
+| 1 | decoded at the nominal 25 fps, encoded at the average 24.9475 | decode with `-r` = the writer's rate | identical result (136,103 frames, same drift) -> rejected, change reverted |
+| 2 | the parts | split the film into the same 16 parts, decode each, compare frames with duration x fps | every part yields ~1.7 frames more than `duration x fps` (e.g. 8501 for 340.68 s at 24.9478) -> confirmed |
+
+The parts are cut with `-c copy`; their header keeps the film's average rate 24.9478 although
+their content runs at ~25 fps, and the constant-rate decode adds about 2 repeated frames at the end
+of each part. 16 parts x ~0.07 s = 1.1-1.5 s.
+
+### Fix
+
+`pipeline.process` decodes at most `n = round(duration x fps)` frames. The rerun of 2829 has its shot
+cuts within 0.03-0.1 s of the source over the whole film.
+
+The finished films were corrected without re-encoding by scaling the video time stamps to the audio
+length (`-itsscale audio/video`). Two films gave equal DTS that way (1-tick frame durations at part
+joins); for one of them the audio was stretched with `atempo` instead. That was wrong for 2829: its
+audio holds 10.8 s less sound than its time line (gaps), and `atempo` closes the gaps, moving the
+sound by up to 10 s. Caught by the audio duration dropping from 5454 s to 5444 s; reverted, and the
+film was re-run instead.
+
+---
+
+## 4. Part processes that hang (RTX 5090, MPS)
+
+### Symptom
+
+A part of a parallel run stopped writing 8 s after its start and stayed alive for 2 h, using no CPU,
+with 932 MB on the GPU; the film waited for it. Later: 2 of 16 parts of the next film, 1 of 16 of
+the one after, and 2 of 16 of a later film after the start had been staggered.
+
+### What is known
+
+- The last log line was always in the start-up: right after loading the OCR models, or at the first
+  OCR call. The main thread slept (`hrtimer_nanosleep`), the other threads and the ffmpeg child
+  waited on futexes. No error in the MPS logs, no OOM, no kernel message.
+- All hung parts had started at the same time as other parts under MPS. Starting parts 20 s apart
+  did not stop the hangs.
+- `py-spy` could not read the process (no ptrace permission in the container).
+
+### Fix (workaround)
+
+The parent restarts a part that printed no progress line 5 min after its start or wrote nothing for
+15 min, at most twice. Cost per hang: up to 5 min of one process. The cause is open.
+
+---
+
+## 5. Logo only partly erased in a dark film (2771)
+
+### Symptom
+
+"190" of the "1905电影网" logo stayed visible; only the right part of the logo was erased.
+
+### Root cause
+
+The mask covered 2060 pixels (x 86-148); the same logo gives ~6000 pixels in the other films. The
+logo is semi-transparent; in a dark film its colour follows the background, so few pixels stay
+within the colour tolerance in 85 % of the samples.
+
+### Fix
+
+The film was re-run logo-only over the result, with the mask of another film of the same frame size
+and logo position. `--probe` now repeats the detection with a looser consistency (0.6) and warns when
+that finds 1.8x as many pixels; `--logo-library` suggests a stored mask that contains the detected one.
+
+---
+
 ## Lessons
 
 - Video inpainting must never mix shots: detect cuts before planning chunks.
@@ -97,3 +176,12 @@ original (`*_clean_pp_fixed.mp4`).
   masking errors that are invisible with LaMa (one frame) become obvious with ProPainter.
 - Reproduce on a short range first, then bisect the frame range; it located the source quickly after
   the parameter-based hypotheses failed.
+- Check picture/audio sync over the whole result, not only the total duration: compare shot-cut
+  times of source and result at the start, middle and end. A drift that grows with the number of
+  parts points at the part boundaries.
+- Prove a fix by its effect before shipping it: the first sync fix produced a byte-identical result.
+- Never retime audio without checking that it has no gaps (audio frames x frame size / sample rate
+  against its duration).
+- A CUDA process started next to an MPS server gets no GPU and runs on the CPU without an error.
+- Verify every logo mask on dark scenes; a short mask is the sign (compare with other films of the
+  same source).
