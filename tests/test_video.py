@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from clean_clear import video
-from clean_clear.video import ThreadedWriter, duration_check, open_writer, prefetch, probe, read_frames
+from clean_clear.video import ThreadedWriter, duration_check, open_writer, packet_count, prefetch, probe, read_frames
 from conftest import ffmpeg, probe_streams, yuv_mean
 
 
@@ -124,3 +124,10 @@ def test_read_frames_window_is_frame_exact(subtitle_video):
     part = list(read_frames(subtitle_video, 640, 360, start=30, count=5))
     assert len(part) == 5
     assert all(np.array_equal(a, b) for a, b in zip(frames[30:35], part))
+
+
+def test_packet_count_is_the_exact_frame_count_of_a_part_cut_with_copy(subtitle_video, tmp_path):
+    part = tmp_path / "part.mkv"
+    ffmpeg("-i", subtitle_video, "-map", "0:v:0", "-c", "copy", part)
+    assert packet_count(part) == 100
+    assert packet_count(tmp_path / "missing.mkv") == 0

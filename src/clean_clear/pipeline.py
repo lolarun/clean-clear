@@ -13,7 +13,7 @@ from .subtitles import frame_boxes, segments_from_ocr, write_srt
 from . import watermark
 from .rewrite import rewrite
 from .stabilize import stabilize
-from .video import ThreadedWriter, detect_cuts, duration_check, open_writer, prefetch, probe, read_frames
+from .video import ThreadedWriter, detect_cuts, duration_check, open_writer, packet_count, prefetch, probe, read_frames
 
 
 def fingerprint(src):
@@ -161,6 +161,8 @@ def process(src, out_dir, args, ocr, backend, encoder):
     src = Path(src)
     out_dir.mkdir(parents=True, exist_ok=True)
     W, H, fps, n = probe(src)
+    if getattr(args, "split_part", False):  # a part: its exact frame count, so no frame is repeated at its end
+        n = packet_count(src) or n
     band = parse_band(args.band, H)
     log(f"\n==> {src.name}  {W}x{H} {fps:.3f}fps  ~{n} frames  subtitle band y={band[0]}-{band[1]}")
 

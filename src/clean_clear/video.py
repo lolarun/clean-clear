@@ -63,6 +63,17 @@ def probe(path):
     return int(s["width"]), int(s["height"]), fps, n
 
 
+def packet_count(path):
+    """Exact number of video frames of a file without decoding it (one packet per frame), or 0 if unknown. A part cut
+    with `-c copy` has no frame count in its header, and its container duration overshoots by up to 3 frames."""
+    r = subprocess.run([_exe("ffprobe"), "-v", "error", "-count_packets", "-select_streams", "v:0", "-show_entries",
+                        "stream=nb_read_packets", "-of", "csv=p=0", str(path)], capture_output=True, text=True)
+    try:
+        return int(r.stdout.strip().split()[0])
+    except (IndexError, ValueError):
+        return 0
+
+
 # ffprobe colour space -> scale filter matrix name
 _MATRIX = {"bt709": "bt709", "smpte170m": "bt601", "bt470bg": "bt601", "fcc": "fcc", "smpte240m": "smpte240m",
            "bt2020nc": "bt2020", "bt2020c": "bt2020"}
