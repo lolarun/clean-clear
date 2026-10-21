@@ -161,6 +161,12 @@ def build_argparser():
                          "logo corner and whether its mask looks complete; letterbox; irregular time stamps and audio "
                          "gaps) and write NAME.probe.json plus probe-batch.txt, a --list file with the suggested "
                          "options per video; nothing is erased")
+    ap.add_argument("--check", action="store_true",
+                    help="compare a result with its source: clean-clear --check SOURCE RESULT [-o DIR]. Checks frame "
+                         "count, resolution, frame rate, pixel aspect ratio, colour, codec, bitrate (not below the "
+                         "source), duration, video start against the audio, audio, size and the SRT next to RESULT; "
+                         "writes qc.json and two contact sheets (source | result) into DIR (default: next to RESULT); "
+                         "exit code 1 if a check fails")
     ap.add_argument("--logo-library", metavar="DIR",
                     help="with --probe: folder of logo masks (PNG, white = logo, one per frame size and position) "
                          "from earlier jobs; when a detected logo mask looks incomplete, a library mask that contains "
@@ -256,7 +262,14 @@ def main(argv=None):
     args = build_argparser().parse_args(argv)
     if args.list:
         return run_list(args, argv)
-    args.jobs = auto_jobs(args) if args.jobs == "auto" else max(1, int(args.jobs))
+    if args.check:
+        if len(args.inputs) != 2:
+            sys.exit("--check needs two inputs: SOURCE RESULT")
+        from .qc import check
+        out = Path(args.out) if args.out != "." else None
+        return 0 if check(args.inputs[0], args.inputs[1], out)["pass"] else 1
+    args.jobs_auto = args.jobs == "auto"  # an automatic count is lowered per video when the processes would not fit
+    args.jobs = auto_jobs(args) if args.jobs_auto else max(1, int(args.jobs))
     import cv2
     cv2.setNumThreads(min(8, usable_cpus()))
     files = collect_inputs(args.inputs)

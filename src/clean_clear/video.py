@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from pathlib import Path
 
 import numpy as np
 
@@ -28,7 +29,7 @@ def _stream_info(path):
     out = subprocess.run(
         [_exe("ffprobe"), "-v", "error", "-select_streams", "v:0", "-show_entries",
          "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,color_space,color_primaries,color_transfer,"
-         "color_range:format=duration", "-of", "json", str(path)],
+         "color_range,sample_aspect_ratio:format=duration", "-of", "json", str(path)],
         capture_output=True, check=True).stdout
     j = json.loads(out)
     return j["streams"][0], float(j["format"].get("duration", 0) or 0)
@@ -101,10 +102,56 @@ def colour(path):
 
 
 def _cfr(path):
-    """Output options that resample a variable-frame-rate video to its average rate (empty for constant rate)"""
+    """Output options for decoding `path` frame by frame: a variable-frame-rate video is resampled to its average
+    rate; any other video yields every decoded frame exactly once (passthrough). Without passthrough the rawvideo
+    output runs in cfr mode and fills the time between the start of the file and a later first video frame (audio
+    starting 0.045 s before the picture) with a copy of the first frame; with the frame count capped at n, the last
+    real frame was then dropped."""
     s, dur = _stream_info(path)
     _, rate, vfr, _ = _timing(s, dur)
-    return ["-fps_mode", "cfr", "-r", rate] if vfr else []
+    return ["-fps_mode", "cfr", "-r", rate] if vfr else ["-fps_mode", "passthrough"]
+
+
+def sar(path):
+    """Sample (pixel) aspect ratio of the video of `path` as 'num/den', or None for square or unknown pixels"""
+    s, _ = _stream_info(path)
+    num, _, den = str(s.get("sample_aspect_ratio") or "").partition(":")
+    if num.isdigit() and den.isdigit() and int(num) and int(den) and int(num) != int(den):
+        return f"{num}/{den}"
+    return None
+
+
+def video_offset(path):
+    """Seconds between the start of `path` (its earliest stream) and its first video frame; 0.0 if they coincide.
+    The encoder writes the picture from time 0; restore_start() puts it back at this offset."""
+    out = subprocess.run([_exe("ffprobe"), "-v", "error", "-select_streams", "v:0", "-show_entries",
+                          "stream=start_time:format=start_time", "-of", "json", str(path)],
+                         capture_output=True, check=True).stdout
+    j = json.loads(out)
+    try:
+        d = float(j["streams"][0].get("start_time") or 0) - float(j.get("format", {}).get("start_time") or 0)
+    except (IndexError, ValueError):
+        return 0.0
+    return d if d > 0.0005 else 0.0
+
+
+def restore_start(src, path):
+    """Shift the video of the finished `path` so it starts as late after the audio as in `src` (the audio of `path`
+    is a copy of the source audio and kept its place). Without this the picture played 45 ms early (seen on a
+    source whose video starts at 0.045 s). Stream copy, no re-encode; returns the shift in seconds."""
+    d = video_offset(src)
+    if not d:
+        return 0.0
+    path = Path(path)
+    tmp = path.with_name(path.stem + ".start" + path.suffix)
+    try:
+        subprocess.run([_exe("ffmpeg"), "-v", "error", "-y", "-itsoffset", f"{d:.6f}", "-i", str(path), "-i", str(path),
+                        "-map", "0:v:0", "-map", "1:a?", "-c", "copy", "-movflags", "+faststart", str(tmp)], check=True)
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return d
 
 
 # Exact YUV<->RGB rounding. With the default flags every decode/encode round trip made the picture ~1.5 luma
@@ -324,12 +371,15 @@ def _video_duration(path):
 
 
 def keyframes(path):
-    """{frame index: exact pts_time string} of the keyframes of a constant-frame-rate video"""
+    """{frame index: exact pts_time string} of the keyframes of a constant-frame-rate video. Indices count from the
+    first video frame, which in our results can come a little after the start of the file (restore_start)."""
     fps = _fps(path)
     out = subprocess.run([_exe("ffprobe"), "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
                           "-show_entries", "frame=pts_time", "-of", "csv=p=0", str(path)],
                          capture_output=True, text=True, check=True).stdout
-    return {round(float(x.strip(",")) * fps): x.strip(",") for x in out.split() if x.strip(",")}
+    times = [x.strip(",") for x in out.split() if x.strip(",")]
+    v0 = float(times[0]) if times else 0.0  # the first frame of a video is a keyframe
+    return {round((float(t) - v0) * fps): t for t in times}
 
 
 def open_writer(src, dst, w, h, fps, encoder, crf, audio=True):
@@ -339,9 +389,11 @@ def open_writer(src, dst, w, h, fps, encoder, crf, audio=True):
     else:
         venc = ["-c:v", encoder, "-preset", "medium", "-crf", str(crf)]
     m, rng, tags = colour(src)  # encode with the source's matrix and range, and say so in the file
+    aspect = sar(src)  # non-square pixels (anamorphic sources): keep the source's display aspect ratio
     cmd = [_exe("ffmpeg"), "-v", "error", "-y",
            "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", f"{fps:.6f}", "-i", "-"]
     cmd += ["-i", str(src), *SWS, "-map", "0:v:0", "-map", "1:a?", "-c:a", "copy"] if audio else [*SWS, "-map", "0:v:0"]
-    cmd += ["-vf", f"scale=flags={SWS_FLAGS}:in_range=pc:out_color_matrix={m}:out_range={rng},format=yuv420p"]
+    cmd += ["-vf", f"scale=flags={SWS_FLAGS}:in_range=pc:out_color_matrix={m}:out_range={rng},format=yuv420p"
+                   + (f",setsar={aspect}" if aspect else "")]
     cmd += [*venc, *tags, "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(dst)]
     return subprocess.Popen(cmd, stdin=subprocess.PIPE)

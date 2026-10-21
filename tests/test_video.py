@@ -4,7 +4,8 @@ import numpy as np
 import pytest
 
 from clean_clear import video
-from clean_clear.video import ThreadedWriter, duration_check, open_writer, packet_count, prefetch, probe, read_frames
+from clean_clear.video import (ThreadedWriter, duration_check, keyframes, open_writer, packet_count, prefetch, probe,
+                               read_frames, restore_start, sar, video_offset)
 from conftest import ffmpeg, probe_streams, yuv_mean
 
 
@@ -131,3 +132,46 @@ def test_packet_count_is_the_exact_frame_count_of_a_part_cut_with_copy(subtitle_
     ffmpeg("-i", subtitle_video, "-map", "0:v:0", "-c", "copy", part)
     assert packet_count(part) == 100
     assert packet_count(tmp_path / "missing.mkv") == 0
+
+
+@pytest.fixture
+def late_video(tmp_path):
+    """2 s of moving test pattern (every frame differs) with audio; the picture starts 0.04 s after the audio, like
+    sources whose video stream starts at 0.045 s. Returns (plain, late)."""
+    plain, late = tmp_path / "plain.mp4", tmp_path / "late.mp4"
+    ffmpeg("-f", "lavfi", "-i", "testsrc=size=160x120:rate=25:d=2", "-f", "lavfi", "-i", "sine=d=2",
+           "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", plain)
+    ffmpeg("-itsoffset", "0.04", "-i", plain, "-i", plain, "-map", "0:v:0", "-map", "1:a", "-c", "copy", late)
+    return plain, late
+
+
+def test_a_late_first_frame_is_neither_repeated_nor_dropped(late_video):
+    plain, late = late_video
+    assert video_offset(late) == pytest.approx(0.04, abs=0.002) and video_offset(plain) == 0.0
+    a = list(read_frames(plain, 160, 120))
+    b = list(read_frames(late, 160, 120, count=probe(late)[3]))
+    assert len(a) == len(b) == 50
+    assert all(np.array_equal(x, y) for x, y in zip(a, b))  # cfr decoding gave frame 0 twice and lost frame 49
+
+
+def test_restore_start_keeps_the_picture_after_the_audio(late_video, tmp_path):
+    _, late = late_video
+    dst = tmp_path / "out.mp4"
+    assert round_trip(late, dst) == 50
+    assert video_offset(dst) == 0.0  # the encoder writes the picture from time 0
+    assert restore_start(late, dst) == pytest.approx(0.04, abs=0.002)
+    assert video_offset(dst) == pytest.approx(0.04, abs=0.002)
+    assert probe(dst)[3] == 50 and min(keyframes(dst)) == 0  # frame numbering still starts at the first frame
+    assert len(list(read_frames(dst, 160, 120))) == 50
+
+
+def test_writer_keeps_the_pixel_aspect_ratio(tmp_path):
+    src, dst = tmp_path / "anamorphic.mp4", tmp_path / "out.mp4"
+    ffmpeg("-f", "lavfi", "-i", "testsrc=size=160x120:rate=25:d=1", "-vf", "setsar=4/3", "-c:v", "libx264",
+           "-pix_fmt", "yuv420p", src)
+    assert sar(src) == "4/3"
+    round_trip(src, dst)
+    assert sar(dst) == "4/3"  # the encoder used to write square pixels: the picture was shown 3/4 as wide
+    plain = tmp_path / "plain.mp4"
+    ffmpeg("-f", "lavfi", "-i", "testsrc=size=160x120:rate=25:d=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", plain)
+    assert sar(plain) is None

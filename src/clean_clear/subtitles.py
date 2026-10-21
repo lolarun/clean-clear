@@ -170,6 +170,14 @@ def similar(a, b):
     return difflib.SequenceMatcher(None, a.replace(" ", ""), b.replace(" ", "")).ratio()
 
 
+def _contains(a, b):
+    """True if one text is the other with characters lost: OCR read "刚开始啊两三毛" for the last 0.4 s of a subtitle
+    that reads "刚开始啊两三毛一斤", and the mask of that short segment did not cover the two characters left"""
+    a, b = a.replace(" ", ""), b.replace(" ", "")
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    return len(short) >= 2 and short in long
+
+
 def _x_overlap(a, b):
     (ax0, ax1), (bx0, bx1) = a.xr, b.xr
     return min(ax1, bx1) - max(ax0, bx0) > 0.4 * min(ax1 - ax0, bx1 - bx0)
@@ -199,7 +207,7 @@ def build_segments(per_frame, max_gap, min_len, keep_edges=False):
         if p and r.start - p.end <= max_gap + 1 and _x_overlap(p, r):
             s = similar(p.text, r.text)
             rl, pl = r.end - r.start + 1, p.end - p.start + 1
-            if s >= 0.9 or (s >= 0.6 and min(rl, pl) < short):
+            if s >= 0.9 or (s >= 0.6 and min(rl, pl) < short) or _contains(p.text, r.text):
                 p.end = r.end
                 p.texts.update(r.texts)
                 p.boxes += r.boxes
@@ -227,7 +235,8 @@ def ts(sec):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def write_srt(segs, fps, path):
+def write_srt(segs, fps, path, offset=0.0):
+    """offset: seconds the first video frame comes after the start of the film (see video.restore_start)"""
     with open(path, "w", encoding="utf-8") as f:
         for k, s in enumerate(segs, 1):
-            f.write(f"{k}\n{ts(s.start / fps)} --> {ts((s.end + 1) / fps)}\n{s.text}\n\n")
+            f.write(f"{k}\n{ts(s.start / fps + offset)} --> {ts((s.end + 1) / fps + offset)}\n{s.text}\n\n")

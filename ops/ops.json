@@ -1,0 +1,15 @@
+{
+ "remote": "gdrive:",
+ "input": "input",
+ "output": "output",
+ "staging": "staging",
+ "log": "log",
+ "ssh_config": "server-ssh-config",
+ "work": "/workspace",
+ "queue_depth": 2,
+ "heartbeat_timeout_minutes": 60,
+ "max_attempts": 2,
+ "deliver_subtitles": true,
+ "csv_bom": false,
+ "rclone_conf": "~/.config/rclone/rclone.conf"
+}

@@ -13,7 +13,8 @@ from .subtitles import frame_boxes, segments_from_ocr, write_srt
 from . import watermark
 from .rewrite import rewrite
 from .stabilize import stabilize
-from .video import ThreadedWriter, detect_cuts, duration_check, open_writer, packet_count, prefetch, probe, read_frames
+from .video import (ThreadedWriter, detect_cuts, duration_check, open_writer, packet_count, prefetch, probe, read_frames,
+                    restore_start, video_offset)
 
 
 def fingerprint(src):
@@ -186,7 +187,7 @@ def process(src, out_dir, args, ocr, backend, encoder):
                                        keep_edges=getattr(args, "split_part", False))
         if line:
             log(f"  subtitle line y~{line[0]:.0f}, text height ~{line[1]:.0f}px")
-        write_srt(segs, fps, srt)
+        write_srt(segs, fps, srt, offset=video_offset(src))
         log(f"  {len(segs)} subtitles -> {srt}  ({time.time() - t0:.0f}s)")
     if backend is None:
         return
@@ -224,6 +225,9 @@ def process(src, out_dir, args, ocr, backend, encoder):
             t0 = time.time()
             verify_and_fix(src, tmp, W, H, fps, n, band, line, cuts, args, ocr, backend, encoder)
             log(f"  verify done ({time.time() - t0:.0f}s)")
+        shift = restore_start(src, tmp)  # last: verify's partial re-encode counts frames from time 0
+        if shift:
+            log(f"  video starts {shift * 1000:.0f} ms after the audio, as in the source")
         warn = duration_check(src, tmp)
         if warn:
             log(f"  WARNING: {warn}")
@@ -244,9 +248,10 @@ def _erase_and_encode(src, dst, W, H, fps, n, frame_seg, masks, cuts, wm, args, 
     prog = Progress("erase", n, cum=np.concatenate([[0.0], np.cumsum(cost)]))
     try:
         # decoding (ffmpeg) overlaps with inference in the main thread instead of alternating with it
-        # at most n frames (duration x fps): decoding a part cut out of a film with a stale frame rate in its header
-        # (nominal 25 fps, average 24.9475) yields ~2 repeated frames at its end; 16 parts later the picture was
-        # 1.5 s late against the audio
+        # at most n frames (duration x fps): decoding in cfr mode a part cut out of a film with a stale frame rate in
+        # its header (nominal 25 fps, average 24.9475) yielded ~2 repeated frames at its end; 16 parts later the
+        # picture was 1.5 s late against the audio. Decoding is passthrough now (video._cfr); the cap stays as a
+        # safety net
         stream = prefetch(read_frames(src, W, H, count=n))
         wm_frames = all_frames(n)
         if wm is not None:  # watermark: the same erase() on every frame; chained lazily, so still one decode + one encode

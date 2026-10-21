@@ -14,7 +14,7 @@ from .common import fmt_time, log
 from .masks import box_masks, frame_masks, glyph_masks
 from .pipeline import _runs, parse_band, run_ocr
 from .subtitles import frame_boxes, segments_from_ocr, subtitle_line
-from .video import ThreadedWriter, _exe, detect_cuts, open_writer, prefetch, probe, read_frames
+from .video import ThreadedWriter, _exe, detect_cuts, open_writer, prefetch, probe, read_frames, restore_start
 from . import watermark
 from .rewrite import plain_timeline, rewrite
 from .stabilize import stabilize
@@ -129,6 +129,7 @@ def refine(cleaned, original, out_dir, args, ocr, backend, encoder):
                 tw.close()
             if wr.returncode != 0:
                 raise RuntimeError(f"ffmpeg encoding failed (code {wr.returncode})")
+        restore_start(original, tmp)  # both paths write the picture from time 0
         tmp.replace(dst)
     except BaseException:
         tmp.unlink(missing_ok=True)

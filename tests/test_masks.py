@@ -13,12 +13,27 @@ def seg(start, end, box=(250, 300, 390, 320)):
 
 
 def strips(n, lit, colour=(255, 255, 255), rect=(60, 80, 250, 390)):
-    """band strips; frames in `lit` show a bar at band rows/cols `rect`"""
+    """band strips; frames in `lit` show thin vertical strokes (4 px wide, every 12 px) at band rows/cols `rect`"""
     y0, y1, x0, x1 = rect
     for i in range(n):
         s = np.full((BAND[1] - BAND[0], W, 3), (160, 96, 48), np.uint8)
         if i in lit:
-            s[y0:y1, x0:x1] = colour
+            for x in range(x0, x1 - 3, 12):
+                s[y0:y1, x:x + 4] = colour
+        yield s
+
+
+def paper_strips(n, lit, outline=True):
+    """white paper (band cols 200-390, rows 40-110) behind the subtitle; frames in `lit` show 4 white strokes at
+    cols 250-297 with a dark outline around each, like a white subtitle on a white notebook"""
+    for i in range(n):
+        s = np.full((BAND[1] - BAND[0], W, 3), (160, 96, 48), np.uint8)
+        s[40:110, 200:390] = 255
+        if i in lit:
+            for x in range(250, 298, 12):
+                if outline:
+                    s[58:82, x - 2:x + 6] = 0
+                s[60:80, x:x + 4] = 255
         yield s
 
 
@@ -51,9 +66,10 @@ def test_glyph_mask_covers_white_strokes_and_shadow(monkeypatch):
     s = seg(10, 29, (245, 295, 395, 325))
     out = glyph_masks("x", W, H, BAND, [s], dilate=4, grow=3, shift=2)
     m = out[0]
-    assert m[300:320, 250:390].all()  # strokes
+    for x in range(250, 386, 12):
+        assert m[300:320, x:x + 4].all()  # every stroke
     # outline (grow 3) on every side, plus the shadow (shift 2) towards the lower right only
-    assert m[324, 320] and m[310, 394] and not m[296, 320] and not m[310, 246]
+    assert m[324, 325] and m[310, 247] and not m[324, 250] and not m[296, 323] and not m[310, 246]
     assert not m[:BAND[0]].any() and not m[200:290].any()
     y0, x0, c = out.crop(0)
     assert c.size < 0.05 * H * W  # stored as a crop, not as a full frame
@@ -72,3 +88,38 @@ def test_glyph_matching_extends_lost_frames(monkeypatch):
     s = seg(10, 29)
     glyph_masks("x", W, H, BAND, [s], dilate=4, grow=3, shift=2, total=45, extend=10)
     assert s.span == (5, 34)
+
+
+def test_a_white_sheet_of_paper_behind_the_subtitle_is_not_erased(monkeypatch):
+    # 1304 at 06:14 and 06:59: the notebook under the subtitle was "white in every frame", counted as glyph pixels,
+    # erased and regenerated as feathery texture
+    monkeypatch.setattr(M, "read_frames", lambda *a, **k: paper_strips(40, set(range(10, 30))))
+    s = seg(10, 29, (245, 295, 395, 325))
+    m = glyph_masks("x", W, H, BAND, [s], dilate=4, grow=3, shift=2)[0]
+    for x in range(250, 298, 12):
+        assert m[300:320, x:x + 4].all()  # the strokes are still erased, also the ones inside the paper
+    assert not m[300:320, 330:390].any()  # the paper beside the text is left alone
+
+
+def test_glyph_matching_does_not_extend_into_white_paper(monkeypatch):
+    # the same strokes are "still there" only because the paper is white at their old positions: the gap between two
+    # subtitles on a notebook (1304, 374.28-374.92 s) was erased although no text was on screen
+    monkeypatch.setattr(M, "read_frames", lambda *a, **k: paper_strips(45, set(range(10, 30))))
+    s = seg(10, 29, (245, 295, 395, 325))
+    glyph_masks("x", W, H, BAND, [s], dilate=4, grow=3, shift=2, total=45, extend=10)
+    assert s.span == (10, 29)
+
+
+def test_glyph_matching_wants_the_dark_outline_back(monkeypatch):
+    # white strokes at the old positions but no outline around them: another white thing, not the text
+    def frames(*a, **k):
+        for i, f in enumerate(paper_strips(45, set(range(10, 30)))):
+            if i < 10 or i > 29:
+                f = f.copy()
+                for x in range(250, 298, 12):
+                    f[60:80, x:x + 4] = 255
+            yield f
+    monkeypatch.setattr(M, "read_frames", frames)
+    s = seg(10, 29, (245, 295, 395, 325))
+    glyph_masks("x", W, H, BAND, [s], dilate=4, grow=3, shift=2, total=45, extend=10)
+    assert s.span == (10, 29)

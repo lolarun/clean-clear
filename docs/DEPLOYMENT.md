@@ -39,7 +39,7 @@ python3 -m venv .venv
 .venv/bin/python -c "import onnxruntime as o; o.preload_dlls(); print(o.get_available_providers())"   # CUDAExecutionProvider = ready
 ```
 
-`scripts/install.sh` does the venv and the package install; `PIP_MIRROR=URL ./scripts/install.sh` selects the mirror (default Aliyun).
+`scripts/install.sh` does the venv and the package install; `PIP_MIRROR=URL ./scripts/install.sh` selects the index (default: the official PyPI, right for servers outside mainland China; in China pass a mirror from the table above). When the tool folder contains `ProPainter/weights/`, it also installs PyTorch and the ProPainter dependencies.
 
 Run installs detached so an SSH disconnect does not abort them, and read the log:
 

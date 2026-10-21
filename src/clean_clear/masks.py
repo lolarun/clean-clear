@@ -16,6 +16,31 @@ def white_pixels(img):
     return (mn > 170) & (mx - mn < 50)
 
 
+def dark_pixels(img):
+    """Dark pixels: the outline around white subtitle glyphs"""
+    return img.max(2) < 80
+
+
+def _text_height(seg):
+    return float(np.median([b[3] - b[1] for b in seg.boxes]))
+
+
+def thin_strokes(white, text_h):
+    """`white` (bool crop) without its thick blobs. Glyph strokes are thin (half a stroke width is about 0.05-0.1 of
+    the text height); a white sheet of paper, a white shirt or a bright wall behind the subtitle is white in every
+    frame as well and was erased as "text", which regenerated the paper and left feathery textures (1304 at 06:14
+    and 06:59). Pixels within the radius of a blob whose inscribed radius exceeds 0.15 text heights are dropped."""
+    if not white.any():
+        return white
+    r = max(3, int(round(0.15 * text_h)))
+    dist = cv2.distanceTransform(white.astype(np.uint8), cv2.DIST_L2, 3)
+    core = dist > r
+    if not core.any():
+        return white
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 3, 2 * r + 3))
+    return white & ~cv2.dilate(core.astype(np.uint8), k).astype(bool)
+
+
 class MaskSet(Mapping):
     """{key: HxW bool mask}, stored as the crop around each mask's pixels.
 
@@ -127,11 +152,13 @@ def box_masks(segs, H, W, dilate):
     return out
 
 
-def _same_glyphs(w, ref, ref_near):
+def _same_glyphs(w, ref, ref_near, dark=None, outline=None):
     """Is the white-pixel image `w` (cropped to a segment's rectangle) the segment's text again? Most of the
     segment's glyph pixels must be white, and there must be little white elsewhere (a different sentence
     in the same place would add as much white outside the old strokes as it covers inside them)."""
     g = np.count_nonzero(ref)
+    if outline is not None and dark is not None and np.count_nonzero(dark & outline) < 0.5 * np.count_nonzero(outline):
+        return False  # the strokes' dark outline is gone: white paper or a shirt under the old glyphs, not the text
     return np.count_nonzero(w & ref) >= 0.6 * g and np.count_nonzero(w & ~ref_near) <= 0.5 * g
 
 
@@ -173,27 +200,43 @@ def glyph_masks(src, W, H, band, segs, dilate, grow, shift, total=0, extend=0, g
                 windows.setdefault(i, []).append((k, "head"))
             for i in range(s.end + 1, hi + 1):
                 windows.setdefault(i, []).append((k, "tail"))
-    head = {}  # k -> [(frame, white rect)] of the head window, judged once the segment's glyphs are known
-    tail = {}  # k -> [glyph reference, dilated reference, bad frames in a row]
+    head = {}  # k -> [(frame, white rect, dark rect)] of the head window, judged once the segment's glyphs are known
+    tail = {}  # k -> [glyph reference, dilated reference, bad frames in a row, outline reference]
     small = np.ones((5, 5), np.uint8)
+    ring_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    dcounts = {}  # k -> per-pixel count of dark frames (the outline of the glyphs)
+    refs = {}
+
+    def glyph_ref(k):
+        """Glyph pixels of segment k: white in more than half of its frames, thin strokes only"""
+        if k not in refs:
+            s = segs[k]
+            refs[k] = thin_strokes((counts[k] >= 0.5 * (s.end - s.start + 1)) & boxc[k], _text_height(s))
+        return refs[k]
 
     def finish(k):
         """The segment's last frame was read: its glyph reference is final; judge the head window, arm the tail"""
         s = segs[k]
-        ref = (counts[k] >= 0.5 * (s.end - s.start + 1)) & boxc[k]
+        ref = glyph_ref(k)
         if ref.sum() < 0.03 * boxc[k].sum():  # no white glyphs: the segment uses a box mask, nothing to match against
             head.pop(k, None)
             return
         near = cv2.dilate(ref.astype(np.uint8), small).astype(bool)
+        ring = cv2.dilate(ref.astype(np.uint8), ring_k).astype(bool) & ~ref & boxc[k]
+        outline = None
+        if ring.any() and k in dcounts:
+            dark_ref = (dcounts[k] >= 0.5 * (s.end - s.start + 1)) & ring
+            if dark_ref.sum() >= 0.3 * ring.sum():  # the subtitle has a dark outline
+                outline = dark_ref
         bad = 0
-        for f, w in reversed(head.pop(k, [])):
-            if _same_glyphs(w, ref, near):
+        for f, w, d in reversed(head.pop(k, [])):
+            if _same_glyphs(w, ref, near, d, outline):
                 s.ext_lo, bad = f, 0
             else:
                 bad += 1
                 if bad > gap:
                     break
-        tail[k] = [ref, near, 0]
+        tail[k] = [ref, near, 0, outline]
 
     prog = Progress("masks", total or len(seg_of))
     for i, strip in enumerate(read_frames(src, W, H, band)):
@@ -201,18 +244,23 @@ def glyph_masks(src, W, H, band, segs, dilate, grow, shift, total=0, extend=0, g
         k = seg_of.get(i)
         if k is not None:
             ry0, ry1, rx0, rx1 = rects[k]
+            crop = strip[ry0:ry1, rx0:rx1]
             c = counts.setdefault(k, np.zeros(boxc[k].shape, np.uint16))
-            c += white_pixels(strip[ry0:ry1, rx0:rx1]) & boxc[k]
+            c += white_pixels(crop) & boxc[k]
+            dcounts.setdefault(k, np.zeros(boxc[k].shape, np.uint16))
+            dcounts[k] += dark_pixels(crop) & boxc[k]
             if i == segs[k].end and extend > 0:
                 finish(k)
         for kw, kind in windows.get(i, ()):
             ry0, ry1, rx0, rx1 = rects[kw]
-            w = white_pixels(strip[ry0:ry1, rx0:rx1])
+            crop = strip[ry0:ry1, rx0:rx1]
+            w = white_pixels(crop)
+            d = dark_pixels(crop)
             if kind == "head":
-                head.setdefault(kw, []).append((i, w))
+                head.setdefault(kw, []).append((i, w, d))
             elif kw in tail and tail[kw][2] <= gap:
-                ref, near, _ = tail[kw]
-                if _same_glyphs(w, ref, near):
+                ref, near, _, outline = tail[kw]
+                if _same_glyphs(w, ref, near, d, outline):
                     segs[kw].ext_hi, tail[kw][2] = i, 0
                 else:
                     tail[kw][2] += 1
@@ -231,7 +279,7 @@ def glyph_masks(src, W, H, band, segs, dilate, grow, shift, total=0, extend=0, g
             continue
         ry0, ry1, rx0, rx1 = rects[k]
         c = counts.get(k)
-        white = (c >= 0.5 * (s.end - s.start + 1)).astype(np.uint8) if c is not None else None
+        white = glyph_ref(k).astype(np.uint8) if c is not None else None
         if white is None or white.sum() < 0.03 * boxc[k].sum():
             out.add(k, by0 + ry0, rx0, boxc[k])
             fallback += 1

@@ -4,6 +4,8 @@ One process leaves most of a big machine idle (GPU calls are separated by single
 several processes on disjoint CPU sets finish the film much sooner. Parts are independent runs of the normal
 pipeline (OCR, masks, watermark, erase, verify), so OCR runs in parallel as well. The watermark mask is
 detected once on the whole film so that every part erases the same pixels."""
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -12,11 +14,11 @@ import sys
 import time
 from pathlib import Path
 
-from .common import fmt_time, log
+from .common import __version__, fmt_time, log
 from .device import gpu_memory_gb
 from .pipeline import output_paths, watermark_cache_path, watermark_mask
 from .subtitles import similar
-from .video import _exe, duration_check, probe
+from .video import _exe, duration_check, packet_count, probe, restore_start, video_offset
 
 # options forwarded to the part processes (argparse dest names)
 _VALUE_OPTS = ["model", "subtitles", "band", "device", "ocr_interval", "ocr_fixed_shape", "encoder", "crf", "mask", "dilate",
@@ -125,16 +127,84 @@ def merge_cues(parts, tol_ms=250):
     return cues
 
 
-def _vram_check(args):
+def _gb_per_process(args, W, H):
+    """GPU memory one process needs. Measured with ProPainter at --pp-chunk 120: ~6.5 GB for 720p, ~13 GB for a 1080p
+    subtitle band; it grows with the frame size and the chunk. LaMa + OCR ~2 GB."""
+    if args.model != "propainter":
+        return 2.0
+    return 6.5 * max(1.0, W * H / (1280 * 720)) * args.pp_chunk / 120
+
+
+def _fit_jobs(args, W, H):
+    """--jobs auto: as many processes as fit in GPU memory for this frame size. auto picked 4 on a 32 GB card for a
+    1080p film (4 x 13 GB): a part died of CUDA out-of-memory at 80 % of the film."""
+    total = gpu_memory_gb()
+    if not getattr(args, "jobs_auto", False) or not total:
+        return args.jobs
+    fit = max(1, int(0.95 * total // _gb_per_process(args, W, H)))
+    if fit < args.jobs:
+        log(f"  {W}x{H}: {args.jobs} processes do not fit in {total:.0f} GB of GPU memory, using {fit}")
+        return fit
+    return args.jobs
+
+
+def _vram_check(args, W, H):
     """Warn if `--jobs` processes will not fit in GPU memory (each loads its own models)"""
     total = gpu_memory_gb()
     if not total:
         return
-    # measured: ProPainter ~13 GB at --pp-chunk 120 for a 1080p subtitle band (grows with the chunk); LaMa + OCR ~2 GB
-    need = (13.0 * args.pp_chunk / 120 + 1.0) if args.model == "propainter" else 2.0
+    need = _gb_per_process(args, W, H) + (1.0 if args.model == "propainter" else 0.0)
     if args.jobs * need > 0.95 * total:
         log(f"  WARNING: {args.jobs} processes need about {args.jobs * need:.0f} GB of GPU memory, the GPU has "
             f"{total:.0f} GB; expect out-of-memory failures. Use fewer --jobs or a smaller --pp-chunk")
+
+
+MAX_OOM_RETRIES = 3  # a part that ran out of GPU memory starts again with fewer processes beside it
+_OOM = re.compile(r"out of memory|OutOfMemory|CUDA_ERROR_OUT_OF_MEMORY", re.I)
+
+
+def _out_of_memory(path):
+    """Did the part process die of an out-of-memory error (end of its output)?"""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - 65536))
+            return bool(_OOM.search(fh.read().decode("utf-8", errors="replace")))
+    except OSError:
+        return False
+
+
+def _clean_part_dir(odir):
+    """Empty a part's output folder for a (re)start but keep its OCR cache: recognition is the same on a retry"""
+    if odir.exists():
+        for f in odir.iterdir():
+            if f.name == ".cache":
+                continue
+            if f.is_dir():
+                shutil.rmtree(f, ignore_errors=True)
+            else:
+                f.unlink(missing_ok=True)
+    odir.mkdir(exist_ok=True)
+
+
+def _plan_key(src, parts, args, wm):
+    """Identity of a split run: the same source, split and options (and code version) give the same part results"""
+    st = Path(src).stat()
+    blob = json.dumps({"size": st.st_size, "mtime": st.st_mtime_ns, "parts": parts, "args": _child_args(args, wm),
+                       "version": __version__}, sort_keys=True)
+    return hashlib.sha1(blob.encode()).hexdigest()
+
+
+def _part_finished(work, k, part_file, key):
+    """A part with a complete result of this plan: its marker, and as many frames as the part it was made from"""
+    odir = work / f"out{k:02d}"
+    clean = odir / (part_file.stem + "_clean.mp4")
+    try:
+        if (odir / ".done").read_text() != key or not clean.exists():
+            return False
+        return packet_count(clean) == packet_count(part_file) > 0
+    except OSError:
+        return False
 
 
 def _last_progress(logfile):
@@ -190,19 +260,19 @@ def _kill(p, fh=None):
         fh.close()
 
 
-def _run_parts(args, files, work, wm, groups, pending, t_all):
+def _run_parts(args, files, work, wm, groups, pending, t_all, on_done=None):
     jobs = args.jobs
+    cap = jobs  # processes at a time; lowered when one runs out of GPU memory
     running = {}  # slot -> (part index, Popen, log file)
-    done, started, restarts = [], {}, {}
+    done, started, restarts, ooms = [], {}, {}, {}
     last_report = last_launch = 0.0
     while pending or running:
         for slot in range(jobs):
-            if slot not in running and pending and time.time() - last_launch >= LAUNCH_GAP:
+            if slot not in running and pending and len(running) < cap and time.time() - last_launch >= LAUNCH_GAP:
                 last_launch = time.time()
                 k = pending.pop(0)
                 odir = work / f"out{k:02d}"
-                shutil.rmtree(odir, ignore_errors=True)
-                odir.mkdir()
+                _clean_part_dir(odir)
                 cmd = [sys.executable, "-m", "clean_clear", str(files[k]), "-o", str(odir)] + _child_args(args, wm)
                 pin = (lambda c=groups[slot]: os.sched_setaffinity(0, c)) if groups[slot] else None
                 fh = open(work / f"part{k:02d}.out", "w")
@@ -231,10 +301,19 @@ def _run_parts(args, files, work, wm, groups, pending, t_all):
             del running[slot]
             fh.close()
             if rc != 0:
+                if _out_of_memory(work / f"part{k:02d}.out") and ooms.get(k, 0) < MAX_OOM_RETRIES:
+                    ooms[k] = ooms.get(k, 0) + 1
+                    cap = max(1, len(running))
+                    log(f"  part {k + 1} ran out of GPU memory: {cap} process(es) at a time from now on, "
+                        f"part {k + 1} starts again ({ooms[k]}/{MAX_OOM_RETRIES})")
+                    pending.insert(0, k)
+                    continue
                 for _, q, qfh in running.values():
                     _kill(q, qfh)
                 raise RuntimeError(f"part {k + 1} failed (code {rc}); see {work / f'part{k:02d}.out'}")
             done.append(k)
+            if on_done:
+                on_done(k)
             log(f"  part {k + 1}/{len(files)} done  ({len(done)}/{len(files)}, {fmt_time(time.time() - t_all)} elapsed)")
         if time.time() - last_report > 60 and running:
             last_report = time.time()
@@ -247,18 +326,25 @@ def process_parallel(src, out_dir, args):
     src = Path(src)
     W, H, fps, n = probe(src)
     duration = n / fps
+    asked = args.jobs
+    args.jobs = _fit_jobs(args, W, H)  # for this video only; restored below
+    try:
+        return _process_parallel(src, out_dir, args, W, H, fps, n, duration)
+    finally:
+        args.jobs = asked
+
+
+def _process_parallel(src, out_dir, args, W, H, fps, n, duration):
     jobs = args.jobs
-    if duration < 240 * jobs:  # less than 2 min per part with the minimum of 2 parts per process
+    if jobs < 2 or duration < 240 * jobs:  # less than 2 min per part with the minimum of 2 parts per process
         return False
     # 4 parts per process, not fewer: the work per part differs a lot (the dense credits at the end of a film took
     # 73 min where the others took 46-56, so with 2 parts per process 3 of 4 processes idled for 29 min at the end)
     parts = min(jobs * 4, int(duration // 120))
     out_dir.mkdir(parents=True, exist_ok=True)
-    _vram_check(args)
+    _vram_check(args, W, H)
     t_all = time.time()
     work = out_dir / f".parts_{src.stem}"
-    shutil.rmtree(work, ignore_errors=True)
-    work.mkdir(parents=True)
     log(f"\n==> {src.name}  {W}x{H} {fps:.3f}fps  {fmt_time(duration)}: {parts} parts, {jobs} processes at a time")
 
     wm = args.watermark
@@ -268,23 +354,40 @@ def process_parallel(src, out_dir, args):
     if args.subtitles == "off" and wm == "off":  # nothing to erase: let the normal path say so
         shutil.rmtree(work, ignore_errors=True)
         return False
-    files = _split(src, work, parts, duration)
-    log(f"  split into {len(files)} parts ({time.time() - t_all:.0f}s)")
+    key = _plan_key(src, parts, args, wm)
+    plan = work / "plan.json"
+    files = sorted(work.glob("part*.mkv")) if work.exists() else []
+    try:
+        resume = bool(files) and json.loads(plan.read_text()).get("key") == key
+    except (OSError, ValueError):
+        resume = False
+    if resume:  # an interrupted run of the same source and options: keep the parts that are finished
+        log(f"  resuming {work.name}: {len(files)} parts")
+    else:
+        shutil.rmtree(work, ignore_errors=True)
+        work.mkdir(parents=True)
+        files = _split(src, work, parts, duration)
+        plan.write_text(json.dumps({"key": key}), encoding="utf-8")
+        log(f"  split into {len(files)} parts ({time.time() - t_all:.0f}s)")
 
     cpus = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else []
     groups = [cpus[k::jobs] for k in range(jobs)] if cpus else [None] * jobs  # interleaved: hyper-thread siblings stay together
-    pending = list(range(len(files)))
-    pending.insert(0, pending.pop())  # the last part first: it holds the credits, the densest subtitles of a film
-    stop_mps = start_mps(args.mps)
-    try:
-        _run_parts(args, files, work, wm, groups, pending, t_all)
-    finally:
-        stop_mps()
+    pending = [k for k in range(len(files)) if not (resume and _part_finished(work, k, files[k], key))]
+    if len(pending) < len(files):
+        log(f"  {len(files) - len(pending)} part(s) are finished already, {len(pending)} to do")
+    if pending:
+        pending.insert(0, pending.pop())  # the last part first: it holds the credits, the densest subtitles of a film
+        stop_mps = start_mps(args.mps)
+        try:
+            _run_parts(args, files, work, wm, groups, pending, t_all,
+                       on_done=lambda k: (work / f"out{k:02d}" / ".done").write_text(key))
+        finally:
+            stop_mps()
 
     # merge: subtitles (time-shifted by the length of the cleaned parts before them), video (stream copy) + the
     # original audio. The offsets come from the frames really written, which is what the merged video consists of.
     cleaned = [work / f"out{k:02d}" / (f.stem + "_clean.mp4") for k, f in enumerate(files)]
-    srt_parts, offset, frames = [], 0.0, 0
+    srt_parts, offset, frames = [], video_offset(src), 0  # the picture starts this late after the audio
     for k, f in enumerate(files):
         srt = work / f"out{k:02d}" / (f.stem + ".srt")
         srt_parts.append((offset, srt.read_text(encoding="utf-8") if srt.exists() else ""))
@@ -301,6 +404,7 @@ def process_parallel(src, out_dir, args):
     try:
         subprocess.run([_exe("ffmpeg"), "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(lst), "-i", str(src),
                         "-map", "0:v:0", "-map", "1:a?", "-c", "copy", "-movflags", "+faststart", str(tmp)], check=True)
+        restore_start(src, tmp)
         if abs(frames - n) > 2:
             log(f"  WARNING: the parts have {frames} frames in total, the source about {n}")
         warn = duration_check(src, tmp)

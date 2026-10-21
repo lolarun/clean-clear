@@ -34,7 +34,7 @@ scripts\install.bat
 ./scripts/install.sh
 ```
 
-The install script creates a `.venv` virtual environment in the repository root and installs the package in editable mode (`pip install -e .`), which provides the `clean-clear` command in `.venv\Scripts` (Windows) or `.venv/bin` (Linux). It uses the Aliyun PyPI mirror by default (on Linux, override with `PIP_MIRROR=...`).
+The install script creates a `.venv` virtual environment in the repository root and installs the package in editable mode (`pip install -e .`), which provides the `clean-clear` command in `.venv\Scripts` (Windows) or `.venv/bin` (Linux). On Linux it installs from the official PyPI (override with `PIP_MIRROR=...`), and also installs PyTorch when the folder contains the ProPainter weights; the Windows script uses the Aliyun mirror.
 
 On a server in mainland China use a local PyPI mirror (Tencent Cloud, Huawei Cloud, ...); see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full server recipe.
 At the end it prints the available inference providers; `CUDAExecutionProvider` means the GPU is ready.
