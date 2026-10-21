@@ -32,11 +32,21 @@ class _FixedShape:
         return getattr(self.inner, name)
 
 
+# Longest side the text detector sees. At 960 a 1080p subtitle band (1920 wide) was halved, and thin, widely spaced
+# strokes were found or not with a grey level of difference: 1304 at 15:44 "二愣子" was boxed around "愣子" in 19 of 20
+# frames, and the "二" stayed on screen. At 1920 it is boxed in all 20 (detector + recogniser ~38 ms per call
+# instead of ~17 ms on an RTX 5090). Part of the OCR cache key (pipeline.ocr_cache_path).
+DET_SIDE = 1920
+# The verify pass only looks for subtitle text that is still readable; at 1920 it took 67 % longer (1304: 871 s
+# against 520 s over the 8 parts) and also picked up a sign and the title as "left over" subtitles.
+VERIFY_DET_SIDE = 960
+
+
 class OCR:
     def __init__(self, device, fixed_shape=False):
         from rapidocr import RapidOCR
         threads = min(4, usable_cpus())  # the default (all cores) is throttled hard under a container CPU quota
-        params = {"Det.limit_type": "max", "Det.limit_side_len": 960,
+        params = {"Det.limit_type": "max", "Det.limit_side_len": DET_SIDE,
                   "Global.log_level": "error",
                   "EngineConfig.onnxruntime.intra_op_num_threads": threads,
                   "EngineConfig.onnxruntime.inter_op_num_threads": 1}
@@ -51,6 +61,13 @@ class OCR:
             if rec is None and hasattr(self.engine, "_load_rec_model"):  # rapidocr >= 3.10 loads models lazily
                 rec = self.engine._load_rec_model()
             rec.session = _FixedShape(rec.session, batch=rec.rec_batch_num)
+
+    def set_det_side(self, side):
+        """Longest side the text detector sees from now on (its preprocessing is rebuilt on every call)"""
+        det = self.engine.text_det
+        if det is None and hasattr(self.engine, "_load_det_model"):  # rapidocr >= 3.10 loads models lazily
+            det = self.engine._load_det_model()
+        det.limit_side_len = side
 
     def __call__(self, img):
         r = self.engine(img, use_cls=False)
@@ -178,6 +195,32 @@ def _contains(a, b):
     return len(short) >= 2 and short in long
 
 
+def _same_place(a, b):
+    """For a pair that `_contains` accepts: do the shorter text's characters sit where they are in the longer text?
+    A subtitle that lost characters keeps the rest in place (1304 at 09:12: offset 0.08 characters), but a short
+    subtitle of its own is centred (1304 at 11:22 "远程教育" after "要架那个远程教育网": 1.5 characters off, at 06:27
+    and 07:41: 3 and 4). Merged, its glyphs were outvoted in the segment's mask and partly left on screen.
+    The comparison uses the line of the longer text at the height of the shorter one: a line of scene text above
+    the subtitle ("MONTBLANC" on a T-shirt) must not move the expected position."""
+    short, long = (a, b) if len(a.text.replace(" ", "")) <= len(b.text.replace(" ", "")) else (b, a)
+    st = short.text.replace(" ", "")
+    if "\n" in st or not short.boxes:
+        return True  # only a one-line text is checked
+    yc = float(np.median([(y0 + y1) / 2 for _, y0, _, y1 in short.boxes]))
+    h = float(np.median([y1 - y0 for _, y0, _, y1 in short.boxes]))
+    row = [bx for bx in long.boxes if abs((bx[1] + bx[3]) / 2 - yc) <= 0.5 * h]
+    line = next((t.replace(" ", "") for t in long.text.split("\n") if st in t.replace(" ", "")), None)
+    if not row or not line:
+        return True
+    lx0, lx1 = min(bx[0] for bx in row), max(bx[2] for bx in row)
+    sx0, sx1 = short.xr
+    cw = (lx1 - lx0) / len(line)
+    i = line.find(st)
+    off0 = (sx0 - (lx0 + i * cw)) / cw
+    off1 = (sx1 - (lx0 + (i + len(st)) * cw)) / cw
+    return min(abs(off0), abs(off1)) <= 0.5
+
+
 def _x_overlap(a, b):
     (ax0, ax1), (bx0, bx1) = a.xr, b.xr
     return min(ax1, bx1) - max(ax0, bx0) > 0.4 * min(ax1 - ax0, bx1 - bx0)
@@ -207,7 +250,7 @@ def build_segments(per_frame, max_gap, min_len, keep_edges=False):
         if p and r.start - p.end <= max_gap + 1 and _x_overlap(p, r):
             s = similar(p.text, r.text)
             rl, pl = r.end - r.start + 1, p.end - p.start + 1
-            if s >= 0.9 or (s >= 0.6 and min(rl, pl) < short) or _contains(p.text, r.text):
+            if s >= 0.9 or (s >= 0.6 and min(rl, pl) < short) or (_contains(p.text, r.text) and _same_place(p, r)):
                 p.end = r.end
                 p.texts.update(r.texts)
                 p.boxes += r.boxes
@@ -218,9 +261,39 @@ def build_segments(per_frame, max_gap, min_len, keep_edges=False):
             or (keep_edges and (s.start <= max_gap or s.end >= last - max_gap))]
 
 
-def segments_from_ocr(per_frame, fps, max_gap=5, min_dur=0.4, line="auto", keep_edges=False):
+STYLE_MIN = 0.25  # outline score (masks.outline_score) below which a box is not a subtitle in an outlined video
+
+
+def outlined_subtitles(per_frame, line):
+    """Are this video's subtitles white with a dark outline? Judged from the outline scores run_ocr stores as each
+    box's 6th value, on the boxes of the subtitle line: True when at least half of them (and at least 25) score
+    STYLE_MIN or more; False otherwise (yellow subtitles, no outline: nothing is filtered by style); None without
+    scores. Every frame OCR read once (repeated results of unchanged frames count once)."""
+    if not line:
+        return None
+    mode, h = line[:2]
+    scores, prev = [], None
+    for boxes in per_frame:
+        if boxes == prev:
+            continue
+        prev = boxes
+        for b in boxes:
+            if len(b) < 6:
+                return None
+            if abs((b[1] + b[3]) / 2 - mode) <= 0.5 * h:
+                scores.append(b[5])
+    good = sum(s >= STYLE_MIN for s in scores)
+    return good >= 25 and good >= 0.5 * len(scores)
+
+
+def segments_from_ocr(per_frame, fps, max_gap=5, min_dur=0.4, line="auto", keep_edges=False, outlined=None):
     """Raw per-frame OCR boxes -> (subtitle line, [Seg]). `line` = a known (y centre, height) to reuse
-    instead of detecting it, e.g. when checking an already cleaned video where almost no text is left"""
+    instead of detecting it, e.g. when checking an already cleaned video where almost no text is left.
+    outlined=True (outlined_subtitles): boxes that do not look like a subtitle are dropped first. Titles, credits,
+    signs and print in the picture were read as subtitles (on the subtitle line, or as the upper line of a
+    two-line subtitle) and erased; a title in red even fell back to a box mask and was smeared (1304 at 1:12)."""
+    if outlined:
+        per_frame = [[b for b in boxes if len(b) < 6 or b[5] >= STYLE_MIN] for boxes in per_frame]
     if line == "auto":
         line = subtitle_line(per_frame)
     texts = [join_text(filter_line(list(b), line)) for b in per_frame]

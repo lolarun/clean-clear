@@ -21,6 +21,20 @@ def dark_pixels(img):
     return img.max(2) < 80
 
 
+_RING5 = np.ones((5, 5), np.uint8)
+
+
+def outline_score(img):
+    """How much the text in `img` (an OCR box) looks like a subtitle: the share of the surroundings of its white
+    pixels that is dark. 1304: subtitles (white with a black outline) 0.43-0.9, also over a white shirt or paper;
+    the title in red, opening credits, a sign, print on a box and a T-shirt 0-0.09."""
+    w = white_pixels(img)
+    if np.count_nonzero(w) < 20:
+        return 0.0
+    ring = cv2.dilate(w.astype(np.uint8), _RING5).astype(bool) & ~w
+    return float(np.count_nonzero(dark_pixels(img) & ring) / max(1, np.count_nonzero(ring)))
+
+
 def _text_height(seg):
     return float(np.median([b[3] - b[1] for b in seg.boxes]))
 

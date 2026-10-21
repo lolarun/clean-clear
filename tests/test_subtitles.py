@@ -2,11 +2,12 @@ from clean_clear.subtitles import build_segments, segments_from_ocr, ts, write_s
 
 
 def frames(spec, n):
-    """spec: {(a, b): text} -> per-frame [(text, boxes)]"""
+    """spec: {(a, b): text or (text, [boxes])} -> per-frame [(text, boxes)]"""
     out = [(None, [])] * n
     for (a, b), t in spec.items():
+        t, boxes = t if isinstance(t, tuple) else (t, [(100, 300, 300, 330)])
         for i in range(a, b + 1):
-            out[i] = (t, [(100, 300, 300, 330)])
+            out[i] = (t, boxes)
     return out
 
 
@@ -40,8 +41,61 @@ def test_srt_follows_a_picture_that_starts_after_the_audio(tmp_path):
 def test_a_subtitle_whose_last_characters_OCR_lost_stays_one_segment():
     # 1304 at 09:12: "刚开始啊两三毛一斤" was followed by 0.4 s read as "刚开始啊两三毛"; the mask of that second
     # segment did not cover the two characters left, and they stayed on screen
-    per = frames({(0, 29): "刚开始啊两三毛一斤", (30, 39): "刚开始啊两三毛"}, 60)
+    # boxes as OCR gave them: the shorter read keeps its left edge, only its right edge moved in
+    per = frames({(0, 29): ("刚开始啊两三毛一斤", [(602, 944, 1318, 1031)]),
+                  (30, 39): ("刚开始啊两三毛", [(608, 944, 1182, 1031)])}, 60)
     segs = build_segments(per, max_gap=2, min_len=10)
     assert [(s.start, s.end) for s in segs] == [(0, 39)]
     other = frames({(0, 29): "刚开始啊两三毛一斤", (30, 39): "后来呀"}, 60)
     assert len(build_segments(other, max_gap=2, min_len=10)) == 2
+
+
+def test_a_short_subtitle_of_its_own_is_not_merged_into_the_longer_one_that_contains_its_text():
+    # 1304 at 11:22: "远程教育" is shown centred on its own after "要架那个远程教育网"; merged, its glyphs were
+    # outvoted in the segment's mask and partly left on screen
+    per = frames({(0, 61): ("要架那个远程教育网", [(620, 944, 1300, 1031)]),
+                  (62, 79): ("远程教育", [(810, 944, 1116, 1035)])}, 100)
+    segs = build_segments(per, max_gap=2, min_len=10)
+    assert [(s.start, s.end, s.text) for s in segs] == [(0, 61, "要架那个远程教育网"), (62, 79, "远程教育")]
+
+
+def test_scene_text_above_the_subtitle_does_not_split_it():
+    # 1304 at 08:33: "MONTBLANC" on a T-shirt is read as a first line above the subtitle for 10 frames; the subtitle
+    # line is in the same place, so it stays one segment (and the T-shirt print is not erased on its own)
+    sub = (546, 944, 1374, 1031)
+    per = frames({(0, 29): ("这样才能更方便大家工作", [sub]),
+                  (30, 39): ("MONTBLANC\n这样才能更方便大家工作", [(700, 780, 1000, 830), sub])}, 60)
+    segs = build_segments(per, max_gap=2, min_len=10)
+    assert [(s.start, s.end) for s in segs] == [(0, 39)]
+
+
+def _scored(n, sub_score, extra=None):
+    """n frames of a centred subtitle on the line (y 300-330, its box jittering by a pixel or two from frame to
+    frame as OCR boxes do) with an outline score; extra: (box, text, score) of other text in the first 40 frames"""
+    out = []
+    for i in range(n):
+        boxes = [[800 + i % 3, 300, 1120 - i % 2, 330, f"第{i // 30}句", sub_score]]
+        if extra and i < 40:
+            (x0, y0, x1, y1), t, s = extra
+            boxes.append([x0, y0, x1, y1, t, s])
+        out.append(boxes)
+    return out
+
+
+def test_text_in_the_picture_is_not_a_subtitle_when_the_subtitles_are_outlined():
+    # 1304: the title "Red Peach", credits, a sign and print on a T-shirt were read as subtitles and erased
+    per = _scored(90, 0.7, ((850, 268, 1070, 296), "Red Peach", 0.0))
+    from clean_clear.subtitles import outlined_subtitles, subtitle_line
+    assert outlined_subtitles(per, subtitle_line(per)) is True
+    _, segs = segments_from_ocr(per, 25, max_gap=2, min_dur=0.4, outlined=True)
+    assert [s.text for s in segs] == ["第0句", "第1句", "第2句"]
+    _, before = segments_from_ocr(per, 25, max_gap=2, min_dur=0.4)
+    assert any("Red Peach" in s.text for s in before)  # without the style it is taken as an upper subtitle line
+
+
+def test_subtitles_without_an_outline_are_not_filtered_by_style():
+    # yellow subtitles, or white ones without an outline: every box scores low, nothing is dropped
+    per = _scored(90, 0.0, ((850, 268, 1070, 296), "Red Peach", 0.0))
+    from clean_clear.subtitles import outlined_subtitles, subtitle_line
+    assert outlined_subtitles(per, subtitle_line(per)) is False
+    assert outlined_subtitles([[[800, 300, 1120, 330, "旧缓存"]]] * 30, (315, 30)) is None  # boxes without scores

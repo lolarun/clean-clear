@@ -5,6 +5,7 @@ warnings.filterwarnings("ignore")  # PyTorch / RAFT deprecation noise would bury
 
 import argparse
 import os
+import re
 import sys
 import time
 import traceback
@@ -24,6 +25,7 @@ from .pipeline import output_paths, process
 from .probe import probe_video, write_outputs
 from .refine import refine
 from .subtitles import OCR
+from . import video
 from .video import VIDEO_EXTS, pick_encoder
 
 
@@ -91,7 +93,11 @@ def build_argparser():
                     help="max frames to skip OCR while the subtitle band is unchanged (1 = OCR every frame)")
     ap.add_argument("--ocr-fixed-shape", default="auto", choices=["auto", "on", "off"],
                     help="feed OCR recognition one fixed input shape. Works around multi-second stalls per new input shape "
-                         "observed on an RTX 5090 with onnxruntime-gpu 1.23. auto = on for compute capability 12+ (default)")
+                         "observed on an RTX 5090 with onnxruntime-gpu 1.23. auto = on for compute capability 12+ with "
+                         "onnxruntime 1.23 or newer (default)")
+    ap.add_argument("--ffmpeg-threads", default="auto",
+                    help="threads per ffmpeg decoder/encoder: auto = half of this process's CPU share (default), "
+                         "0 = ffmpeg's own default, or a number")
     ap.add_argument("--encoder", default="auto", help="auto / h264_nvenc / libx264 / hevc_nvenc ...")
     ap.add_argument("--crf", type=int, default=18, help="quality, lower is better (default: 18)")
     ap.add_argument("--mask", default="glyph", choices=["glyph", "box"],
@@ -254,6 +260,18 @@ def run_list(args, argv):
     return 1 if any(st == "FAILED" for _, st, _ in results) else 0
 
 
+def fixed_shape(args, device):
+    """--ocr-fixed-shape: auto = on for compute capability 12+ with onnxruntime 1.23 or newer, where the stalls were
+    seen. With onnxruntime-gpu 1.22 on an RTX 5090 the recogniser ran without stalls, and padding every batch to
+    6 x 1280 made each OCR call 44 ms instead of 15 (1304, 1500 frames: OCR pass 27 s instead of 19)."""
+    if args.ocr_fixed_shape != "auto":
+        return args.ocr_fixed_shape == "on"
+    if device != "cuda" or gpu_compute_capability() < 12.0:
+        return False
+    import onnxruntime
+    return tuple(int(x) for x in re.findall(r"\d+", onnxruntime.__version__)[:2]) >= (1, 23)
+
+
 def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -268,6 +286,9 @@ def main(argv=None):
         from .qc import check
         out = Path(args.out) if args.out != "." else None
         return 0 if check(args.inputs[0], args.inputs[1], out)["pass"] else 1
+    if args.ffmpeg_threads != "auto" and not args.ffmpeg_threads.isdigit():
+        sys.exit("--ffmpeg-threads: auto, 0 or a number")
+    video.FFMPEG_THREADS = args.ffmpeg_threads
     args.jobs_auto = args.jobs == "auto"  # an automatic count is lowered per video when the processes would not fit
     args.jobs = auto_jobs(args) if args.jobs_auto else max(1, int(args.jobs))
     import cv2
@@ -279,8 +300,7 @@ def main(argv=None):
     set_log_file(out_dir / "clean-clear.log")
     if args.probe:
         device, _ = onnx_providers(args.device)
-        ocr = OCR(device, fixed_shape=args.ocr_fixed_shape == "on" or (
-            args.ocr_fixed_shape == "auto" and device == "cuda" and gpu_compute_capability() >= 12.0))
+        ocr = OCR(device, fixed_shape=fixed_shape(args, device))
         results, failed = [], 0
         for f in files:
             try:
@@ -292,8 +312,7 @@ def main(argv=None):
         return 1 if failed else 0
     if args.find_ads or args.cut_ads:
         device, _ = onnx_providers(args.device)
-        ocr = OCR(device, fixed_shape=args.ocr_fixed_shape == "on" or (
-            args.ocr_fixed_shape == "auto" and device == "cuda" and gpu_compute_capability() >= 12.0))
+        ocr = OCR(device, fixed_shape=fixed_shape(args, device))
         for f in files:
             log(f"\n==> {f.name}: looking for ad pages")
             ads = find_ads(f, ocr)
@@ -315,8 +334,7 @@ def main(argv=None):
         if not models:
             device, prov = onnx_providers(args.device)
             log(f"device: {device}  providers={prov}")
-            fixed = args.ocr_fixed_shape == "on" or (
-                args.ocr_fixed_shape == "auto" and device == "cuda" and gpu_compute_capability() >= 12.0)
+            fixed = fixed_shape(args, device)
             if fixed:
                 log("OCR: fixed recognition input shape")
             ocr = OCR(device, fixed_shape=fixed)

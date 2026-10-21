@@ -148,7 +148,8 @@ clean-clear [INPUT ...] [-o OUT] [-m propainter|lama] [options]
 | `--no-cache` | off | Ignore OCR and watermark caches |
 | `--force` | off | Process videos again even if their `_clean.mp4` and `.srt` already exist |
 | `--watermark` | `auto` | `auto`, `off`, or a mask image path |
-| `--ocr-fixed-shape` | `auto` | Feed OCR recognition a fixed input shape (workaround for multi-second stalls per new shape seen on an RTX 5090); `auto` = on for compute capability 12+ |
+| `--ocr-fixed-shape` | `auto` | Feed OCR recognition a fixed input shape (workaround for multi-second stalls per new shape seen on an RTX 5090 with onnxruntime-gpu 1.23); `auto` = on for compute capability 12+ with onnxruntime 1.23 or newer |
+| `--ffmpeg-threads` | `auto` | Threads per ffmpeg decoder/encoder; `auto` = half of the process's CPU share (`CLEAN_CLEAR_CPUS`, set by the parallel runner to quota / processes), at least 2; `0` = ffmpeg default |
 | `--ocr-interval` | `10` | Max frames to skip OCR while the band is unchanged (`1` = every frame) |
 | `--encoder`, `--crf` | `auto`, `18` | Encoder and quality |
 | `--mask` | `glyph` | `glyph` or `box` |

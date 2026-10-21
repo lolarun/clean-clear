@@ -10,9 +10,29 @@ from pathlib import Path
 
 import numpy as np
 
-from .common import ROOT, Progress
+from .common import ROOT, Progress, cpu_share
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".flv", ".ts", ".m4v", ".wmv", ".webm"}
+FFMPEG_THREADS = "auto"  # --ffmpeg-threads
+
+
+def ffmpeg_threads():
+    """Threads for one ffmpeg decoder or encoder (and its filters); 0 = ffmpeg's own default.
+    ffmpeg sizes its pools from the host's core count: 104 decoding and 76 encoding threads per process on a 208-core
+    host under a 25-core container quota. Four part processes, each decoding and encoding, then used up the quota:
+    throttled in 30 % of the scheduler periods while the GPU was busy 38 % of the time (1304, RTX 5090). Decoding
+    1500 frames took 4.1 s with the default and 4.4 s with 4 threads, but 67 s of CPU against 15. auto = half of the
+    process's CPU share (common.cpu_share), at least 2: 3 per ffmpeg for 4 processes on 25 cores (libx264 1080p
+    still encodes 24 fps, more than the ~10 fps erasing feeds it), 12 for one process (libx264 ~55 fps, default 65)."""
+    if FFMPEG_THREADS != "auto":
+        return max(0, int(FFMPEG_THREADS))
+    return max(2, cpu_share() // 2)
+
+
+def _threads_opts():
+    """ffmpeg options limiting the next input's decoder and all filters to ffmpeg_threads()"""
+    n = ffmpeg_threads()
+    return ["-filter_threads", str(n), "-threads", str(n)] if n else []
 
 
 def _exe(name):
@@ -170,7 +190,7 @@ def _to_bgr(path):
 def read_frames(path, w, h, crop=None, start=0, count=0):
     """Yield frames as read-only BGR ndarrays. With crop=(y0, y1) only that horizontal band is decoded.
     start/count: decode only frames start .. start+count-1 (frame-exact for the constant-rate files we write)."""
-    cmd = [_exe("ffmpeg"), "-v", "error"]
+    cmd = [_exe("ffmpeg"), "-v", "error", *_threads_opts()]
     if start:
         cmd += ["-ss", f"{(start - 0.25) / _fps(path):.6f}"]  # a quarter frame early: output starts exactly at frame `start`
     cmd += ["-i", str(path), *SWS, "-map", "0:v:0", *_cfr(path)]  # -sws_flags only takes effect after the input
@@ -213,7 +233,7 @@ def detect_cuts(path, threshold=12.0, ratio=3.0, window=5, total=0, hist_min=0.2
     motion (0.06-0.09 there) but jumps at the cut (0.33). Sustained fast motion, fire or flashes do not split chunks."""
     import cv2
     w, h = 320, 180
-    cmd = [_exe("ffmpeg"), "-v", "error", "-i", str(path), "-map", "0:v:0", *_cfr(path), "-vf", f"scale={w}:{h}",
+    cmd = [_exe("ffmpeg"), "-v", "error", *_threads_opts(), "-i", str(path), "-map", "0:v:0", *_cfr(path), "-vf", f"scale={w}:{h}",
            "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]  # same frame numbering as read_frames
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=w * h * 3 * 16)
     diffs, hdiffs, prev, prev_h = [], [], None, None
@@ -390,7 +410,10 @@ def open_writer(src, dst, w, h, fps, encoder, crf, audio=True):
         venc = ["-c:v", encoder, "-preset", "medium", "-crf", str(crf)]
     m, rng, tags = colour(src)  # encode with the source's matrix and range, and say so in the file
     aspect = sar(src)  # non-square pixels (anamorphic sources): keep the source's display aspect ratio
-    cmd = [_exe("ffmpeg"), "-v", "error", "-y",
+    n = ffmpeg_threads()
+    if n:
+        venc += ["-threads", str(n)]
+    cmd = [_exe("ffmpeg"), "-v", "error", "-y", *(["-filter_threads", str(n)] if n else []),
            "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", f"{fps:.6f}", "-i", "-"]
     cmd += ["-i", str(src), *SWS, "-map", "0:v:0", "-map", "1:a?", "-c:a", "copy"] if audio else [*SWS, "-map", "0:v:0"]
     cmd += ["-vf", f"scale=flags={SWS_FLAGS}:in_range=pc:out_color_matrix={m}:out_range={rng},format=yuv420p"

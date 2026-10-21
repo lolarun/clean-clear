@@ -27,6 +27,13 @@ def test_ocr_cache_key_follows_options_and_file(tmp_path):
     args = SimpleNamespace(min_score=0.6, min_height=0.015, ocr_interval=10)
     k1 = ocr_cache_path(tmp_path, src, (10, 20), args)
     assert ocr_cache_path(tmp_path, src, (10, 20), SimpleNamespace(**{**vars(args), "min_score": 0.5})) != k1
+    import clean_clear.pipeline as pl
+    old = pl.DET_SIDE
+    try:  # the detector's input size changes the boxes: a cache made at another size must not be reused
+        pl.DET_SIDE = 960
+        assert ocr_cache_path(tmp_path, src, (10, 20), args) != k1
+    finally:
+        pl.DET_SIDE = old
     w1 = watermark_cache_path(tmp_path, src)
     time.sleep(0.01)
     touch(src, b"yy")
@@ -64,3 +71,17 @@ def test_finished_videos_are_skipped_and_failures_logged_with_traceback(tmp_path
     calls.clear()
     cli.main([str(tmp_path), "-o", str(tmp_path), "--force", "--jobs", "1"])
     assert calls == ["bad.mp4", "done.mp4"]
+
+
+def test_fixed_recognition_shape_only_where_the_stalls_were_seen(monkeypatch):
+    import onnxruntime
+    args = SimpleNamespace(ocr_fixed_shape="auto")
+    monkeypatch.setattr(cli, "gpu_compute_capability", lambda: 12.0)
+    monkeypatch.setattr(onnxruntime, "__version__", "1.22.0")
+    assert not cli.fixed_shape(args, "cuda")   # RTX 5090 with 1.22: no stalls, padding only costs time
+    monkeypatch.setattr(onnxruntime, "__version__", "1.23.2")
+    assert cli.fixed_shape(args, "cuda") and not cli.fixed_shape(args, "cpu")
+    monkeypatch.setattr(cli, "gpu_compute_capability", lambda: 8.9)
+    assert not cli.fixed_shape(args, "cuda")
+    assert cli.fixed_shape(SimpleNamespace(ocr_fixed_shape="on"), "cpu")
+    assert not cli.fixed_shape(SimpleNamespace(ocr_fixed_shape="off"), "cuda")

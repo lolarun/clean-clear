@@ -143,7 +143,8 @@ Rules behind the suggestions: subtitles count as present when text sits on one c
 | `--ocr-interval` | `10` | max frames to skip OCR while the subtitle band is unchanged. `1` runs OCR on every frame: most accurate, slowest |
 | `--min-dur` | `0.4` | subtitles shorter than this many seconds are treated as noise |
 | `--watermark` | `auto` | erase a static corner logo on every frame: `auto` samples ~150 frames and finds pixels that never change in the four corners; `off` leaves it; or pass a mask image of the video's size (white = watermark). The detected mask is saved to `.cache/name.watermark.png` for inspection |
-| `--ocr-fixed-shape` | `auto` | feed OCR recognition one fixed input shape; works around multi-second stalls per new input shape observed on an RTX 5090 with onnxruntime-gpu 1.23 (`auto` = on for compute capability 12+) |
+| `--ocr-fixed-shape` | `auto` | feed OCR recognition one fixed input shape; works around multi-second stalls per new input shape observed on an RTX 5090 with onnxruntime-gpu 1.23 (`auto` = on for compute capability 12+ with onnxruntime 1.23 or newer; with 1.22 it only made OCR 3x slower) |
+| `--ffmpeg-threads` | `auto` | threads per ffmpeg decoder/encoder; `auto` = half of the process's CPU share (the CPU quota divided by the part processes), `0` = ffmpeg's own default (sized from the host's core count, which overran a container quota) |
 | `--max-gap` | `5` | missed frames tolerated within one subtitle |
 | `--min-score` | `0.6` | OCR confidence threshold |
 | `--extend-sec` | `3` | when OCR loses a subtitle for part of its time, keep erasing up to this many seconds before/after it while its glyphs are still visible; `0` = off |

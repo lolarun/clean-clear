@@ -175,3 +175,16 @@ def test_writer_keeps_the_pixel_aspect_ratio(tmp_path):
     plain = tmp_path / "plain.mp4"
     ffmpeg("-f", "lavfi", "-i", "testsrc=size=160x120:rate=25:d=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", plain)
     assert sar(plain) is None
+
+
+def test_ffmpeg_threads_follow_the_process_cpu_share(monkeypatch):
+    monkeypatch.setattr(video, "FFMPEG_THREADS", "auto")
+    monkeypatch.setenv("CLEAN_CLEAR_CPUS", "6")      # 25 cores shared by 4 part processes
+    assert video.ffmpeg_threads() == 3
+    assert video._threads_opts() == ["-filter_threads", "3", "-threads", "3"]
+    monkeypatch.setenv("CLEAN_CLEAR_CPUS", "25")     # one process alone
+    assert video.ffmpeg_threads() == 12
+    monkeypatch.setenv("CLEAN_CLEAR_CPUS", "1")
+    assert video.ffmpeg_threads() == 2
+    monkeypatch.setattr(video, "FFMPEG_THREADS", "0")  # ffmpeg's own default: no options at all
+    assert video.ffmpeg_threads() == 0 and video._threads_opts() == []

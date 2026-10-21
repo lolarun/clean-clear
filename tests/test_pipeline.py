@@ -76,3 +76,17 @@ def test_verify_erases_what_the_first_pass_missed(subtitle_video, tmp_path):
     pipeline.process(subtitle_video, out, args(), fake_ocr, MissFirst(), "libx264")
     frames = list(read_frames(out / "film_clean.mp4", 640, 360))
     assert len(frames) == 100 and not white_pixels(frames[50]).any()
+
+
+def test_the_verify_pass_reads_with_the_smaller_detector_and_restores_it(subtitle_video, tmp_path):
+    sides = []
+
+    class SizedOCR:
+        def set_det_side(self, side):
+            sides.append(side)
+
+        def __call__(self, strip):
+            return fake_ocr(strip)
+
+    pipeline.process(subtitle_video, tmp_path / "o", args(), SizedOCR(), BlackFill(), "libx264")
+    assert sides == [pipeline.VERIFY_DET_SIDE, pipeline.DET_SIDE]

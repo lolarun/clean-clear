@@ -123,3 +123,18 @@ def test_glyph_matching_wants_the_dark_outline_back(monkeypatch):
     s = seg(10, 29, (245, 295, 395, 325))
     glyph_masks("x", W, H, BAND, [s], dilate=4, grow=3, shift=2, total=45, extend=10)
     assert s.span == (10, 29)
+
+
+def test_outline_score_tells_a_subtitle_from_other_text():
+    bg = np.full((60, 200, 3), (60, 120, 160), np.uint8)
+    sub = bg.copy()
+    for x in range(20, 180, 20):  # white strokes with a black outline
+        sub[8:52, x - 3:x + 7] = 0
+        sub[10:50, x:x + 4] = 255
+    sign = np.full((60, 200, 3), (180, 80, 30), np.uint8)  # white letters on a blue board, no outline
+    for x in range(20, 180, 20):
+        sign[10:50, x:x + 4] = 255
+    title = bg.copy()
+    title[10:50, 20:180] = (30, 30, 230)  # red title: no white at all
+    assert M.outline_score(sub) > 0.6
+    assert M.outline_score(sign) < 0.1 and M.outline_score(title) == 0.0

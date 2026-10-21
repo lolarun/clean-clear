@@ -14,7 +14,7 @@ import sys
 import time
 from pathlib import Path
 
-from .common import __version__, fmt_time, log
+from .common import __version__, fmt_time, log, usable_cpus
 from .device import gpu_memory_gb
 from .pipeline import output_paths, watermark_cache_path, watermark_mask
 from .subtitles import similar
@@ -24,7 +24,7 @@ from .video import _exe, duration_check, packet_count, probe, restore_start, vid
 _VALUE_OPTS = ["model", "subtitles", "band", "device", "ocr_interval", "ocr_fixed_shape", "encoder", "crf", "mask", "dilate",
                "grow", "shadow", "pad_frames", "max_gap", "min_dur", "min_score", "min_height", "extend_sec",
                "verify", "wm_guard", "stabilize", "propainter_dir", "pp_chunk", "pp_raft_iter", "pp_ctx", "pp_pad",
-               "pp_margin", "pp_ref_stride"]
+               "pp_margin", "pp_ref_stride", "ffmpeg_threads"]
 _SRT_TIME = re.compile(r"(\d+):(\d\d):(\d\d),(\d{3}) --> (\d+):(\d\d):(\d\d),(\d{3})")
 
 
@@ -276,8 +276,10 @@ def _run_parts(args, files, work, wm, groups, pending, t_all, on_done=None):
                 cmd = [sys.executable, "-m", "clean_clear", str(files[k]), "-o", str(odir)] + _child_args(args, wm)
                 pin = (lambda c=groups[slot]: os.sched_setaffinity(0, c)) if groups[slot] else None
                 fh = open(work / f"part{k:02d}.out", "w")
+                # each part plans its thread pools (video.ffmpeg_threads) for its share of the CPU quota
+                env = dict(os.environ, CLEAN_CLEAR_CPUS=str(max(2, usable_cpus() // jobs)))
                 running[slot] = (k, subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, preexec_fn=pin,
-                                                     start_new_session=True), fh)
+                                                     start_new_session=True, env=env), fh)
                 started[k] = time.time()
                 log(f"  part {k + 1}/{len(files)} started (slot {slot})")
         time.sleep(3)

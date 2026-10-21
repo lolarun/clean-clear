@@ -8,8 +8,9 @@ import cv2
 import numpy as np
 
 from .common import Progress, fmt_time, log
-from .masks import box_masks, frame_masks, glyph_masks, white_pixels
-from .subtitles import frame_boxes, segments_from_ocr, write_srt
+from .masks import box_masks, frame_masks, glyph_masks, outline_score, white_pixels
+from .subtitles import (DET_SIDE, VERIFY_DET_SIDE, frame_boxes, outlined_subtitles, segments_from_ocr, subtitle_line,
+                        write_srt)
 from . import watermark
 from .rewrite import rewrite
 from .stabilize import stabilize
@@ -25,7 +26,7 @@ def fingerprint(src):
 
 def ocr_cache_path(out_dir, src, band, args):
     """OCR results depend on the file and on the options applied while recognising, so all of them are in the key"""
-    opts = f"{args.min_score}:{args.min_height}:{args.ocr_interval}"
+    opts = f"{args.min_score}:{args.min_height}:{args.ocr_interval}:{DET_SIDE}:outline-score"
     key = hashlib.sha1(f"{fingerprint(src)}:{opts}".encode()).hexdigest()[:10]
     return Path(out_dir) / ".cache" / f"{Path(src).stem}.{band[0]}-{band[1]}.{key}.ocr.json"
 
@@ -74,7 +75,9 @@ def run_ocr(src, W, H, n, band, ocr, args, label="ocr"):
                 per_frame.append(per_frame[-1])
                 prog.update(i + 1, txt)
                 continue
-        boxes = frame_boxes(ocr(strip), band[0], W, min_h, args.min_score)
+        # each box gets its outline score as a 6th value (subtitles.outlined_subtitles)
+        boxes = [[*b, round(outline_score(strip[max(0, b[1] - band[0]):max(0, b[3] - band[0]), b[0]:b[2]]), 2)]
+                 for b in frame_boxes(ocr(strip), band[0], W, min_h, args.min_score)]
         per_frame.append(boxes)
         ref, last = sig, i
         n_ocr += 1
@@ -115,15 +118,21 @@ def watermark_mask(src, out_dir, W, H, fps, n, args):
     return m
 
 
-def verify_and_fix(src, dst, W, H, fps, n, band, line, cuts, args, ocr, backend, encoder):
+def verify_and_fix(src, dst, W, H, fps, n, band, line, cuts, args, ocr, backend, encoder, outlined=None):
     """Second look at the finished video: OCR its subtitle band again. Whatever is still readable was missed by
     the first pass (OCR lost it, mask too small, ...); it is erased in one more pass that re-encodes only the
-    keyframe windows around it and copies the rest of the file."""
+    keyframe windows around it and copies the rest of the file. `outlined`: the first pass's judgement of the
+    subtitle style (in the result most of what is left is other text, so it is not judged again here)."""
     if line is None:
         return
-    per_frame = run_ocr(dst, W, H, n, band, ocr, args, label="verify")
+    side = getattr(ocr, "set_det_side", lambda s: None)  # a plain OCR function (tests) has no detector size
+    side(VERIFY_DET_SIDE)
+    try:
+        per_frame = run_ocr(dst, W, H, n, band, ocr, args, label="verify")
+    finally:
+        side(DET_SIDE)
     _, segs = segments_from_ocr(per_frame, fps, max_gap=args.max_gap, min_dur=args.min_dur * 0.5, line=line,
-                                keep_edges=getattr(args, "split_part", False))
+                                keep_edges=getattr(args, "split_part", False), outlined=outlined)
     if not segs:
         log("  verify: no subtitle left in the result")
         return
@@ -169,7 +178,7 @@ def process(src, out_dir, args, ocr, backend, encoder):
 
     dst, srt, tmp = output_paths(src, out_dir)
     if args.subtitles == "off":  # watermark only: no OCR, no SRT, no subtitle masks
-        line, segs = None, []
+        line, segs, outlined = None, [], None
         log("  subtitles off: only the watermark is erased")
     else:
         # Pass 1: OCR (raw results are cached as JSON so reruns skip recognition)
@@ -182,9 +191,12 @@ def process(src, out_dir, args, ocr, backend, encoder):
             per_frame = run_ocr(src, W, H, n, band, ocr, args)
             cache.parent.mkdir(exist_ok=True)
             cache.write_text(json.dumps(per_frame, ensure_ascii=False), encoding="utf-8")
+        outlined = outlined_subtitles(per_frame, subtitle_line(per_frame))
+        if outlined:
+            log("  subtitles are white with a dark outline: other text in the picture is left alone")
         # a part of a --jobs split: a subtitle cut by the split is short here but not noise, keep it at the edges
         line, segs = segments_from_ocr(per_frame, fps, max_gap=args.max_gap, min_dur=args.min_dur,
-                                       keep_edges=getattr(args, "split_part", False))
+                                       keep_edges=getattr(args, "split_part", False), outlined=outlined)
         if line:
             log(f"  subtitle line y~{line[0]:.0f}, text height ~{line[1]:.0f}px")
         write_srt(segs, fps, srt, offset=video_offset(src))
@@ -223,7 +235,7 @@ def process(src, out_dir, args, ocr, backend, encoder):
         log(f"  video -> {dst}  ({time.time() - t0:.0f}s, {backend.name})")
         if args.verify == "on" and args.subtitles == "on":
             t0 = time.time()
-            verify_and_fix(src, tmp, W, H, fps, n, band, line, cuts, args, ocr, backend, encoder)
+            verify_and_fix(src, tmp, W, H, fps, n, band, line, cuts, args, ocr, backend, encoder, outlined)
             log(f"  verify done ({time.time() - t0:.0f}s)")
         shift = restore_start(src, tmp)  # last: verify's partial re-encode counts frames from time 0
         if shift:

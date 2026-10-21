@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "0.3.7"
+__version__ = "0.3.8"
 
 # Repository root (source checkout / editable install): holds models/, an optional ffmpeg/ folder and ProPainter/
 ROOT = Path(__file__).resolve().parents[2]
@@ -27,6 +27,15 @@ def usable_cpus():
     except (OSError, ValueError):
         pass
     return n
+
+
+def cpu_share():
+    """CPUs this process should plan its thread pools for: CLEAN_CLEAR_CPUS when the parallel runner gave each part
+    process its share of the machine (the container quota is shared by all of them), otherwise all usable ones"""
+    try:
+        return max(1, int(os.environ["CLEAN_CLEAR_CPUS"]))
+    except (KeyError, ValueError):
+        return usable_cpus()
 
 
 def set_log_file(path):
