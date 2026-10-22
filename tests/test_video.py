@@ -55,8 +55,11 @@ UNTAGGED = ["-bsf:v", "h264_metadata=matrix_coefficients=2:colour_primaries=2:tr
                                               ("smptebars", "640x360", False)])
 def test_colours_survive_a_round_trip(tmp_path, bars, size, tagged):
     src, dst = tmp_path / "bars.mp4", tmp_path / "out.mp4"
+    # tagged: say BT.709 on the command line. The bars source marks its frames itself, and ffmpeg 7.1.1 marks the HD bars
+    # BT.470BG (601): the file then says 601 for colours that only fit RGB as 709, the decode (rightly) follows the file,
+    # the saturated bars clip (Y 63 -> 79) and the test failed with a defect that was in the test film, not in the tool
     ffmpeg("-f", "lavfi", "-i", f"{bars}=s={size}:r=25:d=1", "-c:v", "libx264", "-pix_fmt", "yuv420p",
-           *([] if tagged else UNTAGGED), src)
+           *(["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"] if tagged else UNTAGGED), src)
     round_trip(src, dst)
     w, h = map(int, size.split("x"))
     for x in (w // 2 + w // 16, w // 4, w // 9):  # saturated areas
@@ -188,3 +191,19 @@ def test_ffmpeg_threads_follow_the_process_cpu_share(monkeypatch):
     assert video.ffmpeg_threads() == 2
     monkeypatch.setattr(video, "FFMPEG_THREADS", "0")  # ffmpeg's own default: no options at all
     assert video.ffmpeg_threads() == 0 and video._threads_opts() == []
+
+
+@pytest.mark.parametrize("rate", ["24000/1001", "30000/1001", "60000/1001", "25/1", "24/1"])
+def test_the_result_states_the_frame_rate_of_the_source_exactly(tmp_path, rate):
+    # NTSC rates came out as 991001/41333, 979001/32666 and 979001/16333: right picture, another stated rate
+    src, dst = tmp_path / "s.mp4", tmp_path / "d.mp4"
+    ffmpeg("-f", "lavfi", "-i", f"testsrc2=size=128x96:rate={rate}:duration=2", "-f", "lavfi", "-i", "sine=duration=2",
+           "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", src)
+    w, h, fps, n = probe(src)
+    tw = ThreadedWriter(open_writer(src, dst, w, h, fps, "libx264", 23))
+    for f in read_frames(src, w, h, count=n):
+        tw.write(f)
+    tw.close()
+    entries = "stream=r_frame_rate,avg_frame_rate,nb_frames"
+    a, b = probe_streams(src, entries)[0], probe_streams(dst, entries)[0]
+    assert (b["r_frame_rate"], b["avg_frame_rate"], b["nb_frames"]) == (a["r_frame_rate"], a["avg_frame_rate"], a["nb_frames"])

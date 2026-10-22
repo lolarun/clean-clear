@@ -95,6 +95,10 @@ def build_argparser():
                     help="feed OCR recognition one fixed input shape. Works around multi-second stalls per new input shape "
                          "observed on an RTX 5090 with onnxruntime-gpu 1.23. auto = on for compute capability 12+ with "
                          "onnxruntime 1.23 or newer (default)")
+    ap.add_argument("--compose", default="auto", choices=["auto", "off"],
+                    help="auto: the result is composed in the source's own YUV, so pixels that are not erased stay exactly "
+                         "as they were (needs 8-bit 4:2:0, limited range); off: the erased frames are converted through "
+                         "RGB as a whole (every pixel changes a little: 43 dB against the source, 38 dB at worst)")
     ap.add_argument("--ffmpeg-threads", default="auto",
                     help="threads per ffmpeg decoder/encoder: auto = half of this process's CPU share (default), "
                          "0 = ffmpeg's own default, or a number")
@@ -108,7 +112,15 @@ def build_argparser():
                     help="extra glyph mask dilation towards the lower right (covers the shadow)")
     ap.add_argument("--pad-frames", type=int, default=1,
                     help="extra frames erased before/after each subtitle (fade in/out)")
+    ap.add_argument("--keep-ranges", default="", metavar="START-END[,START-END...]",
+                    help="parts of the film that are left as they are: no OCR, no erasing, no subtitles in the SRT "
+                         "(opening title and credits, closing credits), times as for --cut, 'end' = the end of the film, "
+                         "e.g. 0-95,1:28:00-end")
     ap.add_argument("--max-gap", type=int, default=5, help="missed frames tolerated within one subtitle")
+    ap.add_argument("--bridge-sec", type=float, default=1.0,
+                    help="when OCR loses a subtitle's text for up to this many seconds and then reads the very same text "
+                         "in the same place, it is one subtitle (frames of the gap without a subtitle are not erased); "
+                         "0 = only --max-gap")
     ap.add_argument("--min-dur", type=float, default=0.4,
                     help="subtitles shorter than this many seconds are treated as noise")
     ap.add_argument("--extend-sec", type=float, default=3.0,
@@ -173,6 +185,13 @@ def build_argparser():
                          "source), duration, video start against the audio, audio, size and the SRT next to RESULT; "
                          "writes qc.json and two contact sheets (source | result) into DIR (default: next to RESULT); "
                          "exit code 1 if a check fails")
+    ap.add_argument("--qc-subtitles", action="store_true",
+                    help="look for subtitles still on screen in a result: clean-clear --qc-subtitles SOURCE RESULT "
+                         "[-o DIR] [--srt FILE]. Calibration on synthetic samples, five frames per subtitle of the SRT "
+                         "(next to RESULT unless --srt), a blind scan of one frame per second and a logo check; writes "
+                         "report.md, findings.csv, evidence/ and contact sheets into DIR (default: next to RESULT, "
+                         "subtitle_check_DATE); exit code 1 when a leftover is found, 2 when only a person can decide")
+    ap.add_argument("--srt", metavar="FILE", help="with --qc-subtitles: the subtitle file of the result")
     ap.add_argument("--logo-library", metavar="DIR",
                     help="with --probe: folder of logo masks (PNG, white = logo, one per frame size and position) "
                          "from earlier jobs; when a detected logo mask looks incomplete, a library mask that contains "
@@ -286,9 +305,24 @@ def main(argv=None):
         from .qc import check
         out = Path(args.out) if args.out != "." else None
         return 0 if check(args.inputs[0], args.inputs[1], out)["pass"] else 1
+    try:
+        from .pipeline import parse_keep
+        parse_keep(args.keep_ranges, 10 ** 9)
+    except ValueError as e:
+        sys.exit(str(e))
     if args.ffmpeg_threads != "auto" and not args.ffmpeg_threads.isdigit():
         sys.exit("--ffmpeg-threads: auto, 0 or a number")
     video.FFMPEG_THREADS = args.ffmpeg_threads
+    if args.qc_subtitles:
+        if len(args.inputs) != 2:
+            sys.exit("--qc-subtitles needs two inputs: SOURCE RESULT")
+        from .subtitle_qc import check_subtitles
+        device, _ = onnx_providers(args.device)
+        res = Path(args.inputs[1])
+        out = Path(args.out) if args.out != "." else res.parent / time.strftime("subtitle_check_%Y%m%d")
+        summary = check_subtitles(args.inputs[0], res, out, OCR(device, fixed_shape=fixed_shape(args, device)), args.srt,
+                                  args.keep_ranges)
+        return {"合格": 0, "需返工": 1}.get(summary["conclusion"], 2)
     args.jobs_auto = args.jobs == "auto"  # an automatic count is lowered per video when the processes would not fit
     args.jobs = auto_jobs(args) if args.jobs_auto else max(1, int(args.jobs))
     import cv2

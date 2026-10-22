@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 
 from .common import Progress, log
+from .subtitles import STYLE_MIN
 from .video import read_frames
 
 
@@ -176,7 +177,7 @@ def _same_glyphs(w, ref, ref_near, dark=None, outline=None):
     return np.count_nonzero(w & ref) >= 0.6 * g and np.count_nonzero(w & ~ref_near) <= 0.5 * g
 
 
-def glyph_masks(src, W, H, band, segs, dilate, grow, shift, total=0, extend=0, gap=2):
+def glyph_masks(src, W, H, band, segs, dilate, grow, shift, total=0, extend=0, gap=2, outlined=False):
     """Glyph masks: within a segment, pixels that are white in more than half of the frames are text;
     they are then dilated to cover the outline and shadow. Inpainting only the strokes instead of the
     whole text box keeps far more original pixels, so the result is sharper, and the mask is fixed
@@ -187,7 +188,13 @@ def glyph_masks(src, W, H, band, segs, dilate, grow, shift, total=0, extend=0, g
     which leaves the rest of the sentence on screen. Up to `extend` frames before/after each segment are
     checked against the segment's own glyph pixels; frames where the same glyphs are still visible
     (tolerating `gap` bad frames) widen the segment's erase range (Seg.ext_lo / Seg.ext_hi). This
-    happens inside the same pass over the video, so it costs no extra decoding. Returns a MaskSet."""
+    happens inside the same pass over the video, so it costs no extra decoding. Returns a MaskSet.
+
+    Seg.gaps: frames where OCR lost the text between two reads of the same subtitle (subtitles.build_segments joined
+    them). They are neither counted for the glyphs nor erased unless they show a subtitle: with outlined=True (white
+    subtitles with a dark outline) a gap frame whose box area scores below STYLE_MIN (outline_score) goes to Seg.skip
+    (1304 at 12:29: text behind a sliding sign stayed on screen, but "卖什么油桃" ... "还卖什么油桃" at 2:04 have 0.8 s
+    of plain picture between them)."""
     by0, by1 = band
     # each segment's box rectangle in band coordinates and its box mask cropped to it; pixels are only counted there
     rects, boxc = [], []
@@ -199,7 +206,11 @@ def glyph_masks(src, W, H, band, segs, dilate, grow, shift, total=0, extend=0, g
         else:
             rects.append((r[0] - by0, r[1] - by0, r[2], r[3]))
             boxc.append(r[4])
-    seg_of = {i: k for k, s in enumerate(segs) if rects[k] for i in range(s.start, s.end + 1)}
+    gap_of = {i: k for k, s in enumerate(segs) if rects[k] for a, b in s.gaps for i in range(a, b + 1)}
+    seg_of = {i: k for k, s in enumerate(segs) if rects[k] for i in range(s.start, s.end + 1) if i not in gap_of}
+    # frames that vote for a segment's glyphs: its own, without the gaps (more than half of THOSE must show a stroke)
+    n_vote = {k: sum(1 for i in range(s.start, s.end + 1) if i not in gap_of) for k, s in enumerate(segs)}
+    gap_score = {}  # k -> {frame: outline score of the box area}
     counts = {}
 
     # frame -> [(segment, "head"|"tail")] windows to check; neighbouring segments bound each window
@@ -225,7 +236,7 @@ def glyph_masks(src, W, H, band, segs, dilate, grow, shift, total=0, extend=0, g
         """Glyph pixels of segment k: white in more than half of its frames, thin strokes only"""
         if k not in refs:
             s = segs[k]
-            refs[k] = thin_strokes((counts[k] >= 0.5 * (s.end - s.start + 1)) & boxc[k], _text_height(s))
+            refs[k] = thin_strokes((counts[k] >= 0.5 * n_vote[k]) & boxc[k], _text_height(s))
         return refs[k]
 
     def finish(k):
@@ -239,7 +250,7 @@ def glyph_masks(src, W, H, band, segs, dilate, grow, shift, total=0, extend=0, g
         ring = cv2.dilate(ref.astype(np.uint8), ring_k).astype(bool) & ~ref & boxc[k]
         outline = None
         if ring.any() and k in dcounts:
-            dark_ref = (dcounts[k] >= 0.5 * (s.end - s.start + 1)) & ring
+            dark_ref = (dcounts[k] >= 0.5 * n_vote[k]) & ring
             if dark_ref.sum() >= 0.3 * ring.sum():  # the subtitle has a dark outline
                 outline = dark_ref
         bad = 0
@@ -255,6 +266,10 @@ def glyph_masks(src, W, H, band, segs, dilate, grow, shift, total=0, extend=0, g
     prog = Progress("masks", total or len(seg_of))
     for i, strip in enumerate(read_frames(src, W, H, band)):
         prog.update(i + 1)
+        kg = gap_of.get(i)
+        if kg is not None and outlined:
+            ry0, ry1, rx0, rx1 = rects[kg]
+            gap_score.setdefault(kg, {})[i] = outline_score(strip[ry0:ry1, rx0:rx1])
         k = seg_of.get(i)
         if k is not None:
             ry0, ry1, rx0, rx1 = rects[k]
@@ -278,6 +293,11 @@ def glyph_masks(src, W, H, band, segs, dilate, grow, shift, total=0, extend=0, g
                     segs[kw].ext_hi, tail[kw][2] = i, 0
                 else:
                     tail[kw][2] += 1
+    for k, d in gap_score.items():
+        segs[k].skip = {i for i, sc in d.items() if sc < STYLE_MIN}
+    if any(s.gaps for s in segs):
+        n = sum(b - a + 1 for s in segs for a, b in s.gaps)
+        log(f"  OCR lost the text for {n} frames inside subtitles; {sum(len(s.skip) for s in segs)} of them show no subtitle")
     if extend > 0:
         n_lo = sum(s.ext_lo is not None for s in segs)
         n_hi = sum(s.ext_hi is not None for s in segs)
@@ -323,7 +343,8 @@ def frame_masks(segs, masks, pad):
     for k, s in enumerate(segs):
         lo, hi = s.span
         for i in range(max(0, lo - pad), hi + pad + 1):
-            cover.setdefault(i, []).append(k)
+            if i not in s.skip:
+                cover.setdefault(i, []).append(k)
     frame_key = {i: tuple(ks) for i, ks in cover.items()}
     if not isinstance(masks, MaskSet):
         masks = MaskSet.from_full(masks)

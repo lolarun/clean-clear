@@ -99,3 +99,25 @@ def test_subtitles_without_an_outline_are_not_filtered_by_style():
     from clean_clear.subtitles import outlined_subtitles, subtitle_line
     assert outlined_subtitles(per, subtitle_line(per)) is False
     assert outlined_subtitles([[[800, 300, 1120, 330, "旧缓存"]]] * 30, (315, 30)) is None  # boxes without scores
+
+
+def test_a_dropout_of_up_to_the_bridge_joins_the_very_same_text_in_the_same_place():
+    # 1304 at 12:29: "行行行" read for 10 frames, lost for 13 behind a sign that slid past, read again for 2 frames
+    box = (835, 937, 1085, 1041)
+    per = frames({(0, 9): ("行行行", [box]), (23, 24): ("行行行", [box])}, 40)
+    assert [(s.start, s.end) for s in build_segments(per, max_gap=5, min_len=10)] == [(0, 9)]  # the 2 frames were noise
+    segs = build_segments(per, max_gap=5, min_len=10, bridge=25)
+    assert [(s.start, s.end, s.gaps) for s in segs] == [(0, 24, [(10, 22)])]
+    assert build_segments(per, max_gap=5, min_len=10, bridge=12)[0].end == 9   # a longer dropout than the bridge: not joined
+
+
+def test_similar_but_different_subtitles_with_a_blank_between_are_not_joined():
+    # 1304 at 2:04: "卖什么油桃", 0.8 s of plain picture, "还卖什么油桃": the texts are 0.91 similar and one contains the other
+    per = frames({(0, 29): ("卖什么油桃", [(770, 940, 1154, 1030)]), (48, 77): ("还卖什么油桃", [(730, 940, 1195, 1030)])}, 90)
+    segs = build_segments(per, max_gap=5, min_len=10, bridge=25)
+    assert [(s.start, s.end) for s in segs] == [(0, 29), (48, 77)]
+
+
+def test_the_same_text_in_another_place_is_not_joined():
+    per = frames({(0, 14): ("好", [(900, 940, 960, 1030)]), (25, 39): ("好", [(300, 940, 360, 1030)])}, 50)
+    assert len(build_segments(per, max_gap=5, min_len=10, bridge=25)) == 2

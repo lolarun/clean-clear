@@ -8,14 +8,16 @@ import cv2
 import numpy as np
 
 from .common import Progress, fmt_time, log
+from .cutter import parse_time
 from .masks import box_masks, frame_masks, glyph_masks, outline_score, white_pixels
 from .subtitles import (DET_SIDE, VERIFY_DET_SIDE, frame_boxes, outlined_subtitles, segments_from_ocr, subtitle_line,
                         write_srt)
 from . import watermark
 from .rewrite import rewrite
 from .stabilize import stabilize
-from .video import (ThreadedWriter, detect_cuts, duration_check, open_writer, packet_count, prefetch, probe, read_frames,
-                    restore_start, video_offset)
+from . import yuvcomp
+from .video import (ThreadedWriter, can_compose_yuv, detect_cuts, duration_check, open_writer, packet_count, prefetch, probe,
+                    read_frames, read_yuv, restore_start, video_offset)
 
 
 def fingerprint(src):
@@ -26,7 +28,7 @@ def fingerprint(src):
 
 def ocr_cache_path(out_dir, src, band, args):
     """OCR results depend on the file and on the options applied while recognising, so all of them are in the key"""
-    opts = f"{args.min_score}:{args.min_height}:{args.ocr_interval}:{DET_SIDE}:outline-score"
+    opts = f"{args.min_score}:{args.min_height}:{args.ocr_interval}:{DET_SIDE}:outline-score:{getattr(args, 'keep_ranges', '')}"
     key = hashlib.sha1(f"{fingerprint(src)}:{opts}".encode()).hexdigest()[:10]
     return Path(out_dir) / ".cache" / f"{Path(src).stem}.{band[0]}-{band[1]}.{key}.ocr.json"
 
@@ -58,16 +60,43 @@ def parse_band(s, H):
     return max(0, a), min(H, b)
 
 
-def run_ocr(src, W, H, n, band, ocr, args, label="ocr"):
+def parse_keep(spec, duration):
+    """--keep-ranges: '0-95,1:30:00-end' -> [(start s, end s)] ('end' = the end of the video, times as for --cut); '' -> []"""
+    out = []
+    for part in (spec or "").split(","):
+        if not part.strip():
+            continue
+        a, sep, b = part.partition("-")
+        if not sep:
+            raise ValueError(f"--keep-ranges expects START-END[,START-END...], got {part!r}")
+        a = parse_time(a)
+        b = duration if b.strip().lower() == "end" else parse_time(b)
+        if b <= a:
+            raise ValueError(f"--keep-ranges: the range ends before it starts: {part!r}")
+        out.append((a, min(b, duration)))
+    return sorted(out)
+
+
+def keep_frames(spec, fps, n):
+    """Indices of the frames of the --keep-ranges (opening and closing credits, ...): no OCR, no erasing"""
+    return {i for a, b in parse_keep(spec, n / fps) for i in range(max(0, int(a * fps)), min(n, int(b * fps) + 1))}
+
+
+def run_ocr(src, W, H, n, band, ocr, args, label="ocr", keep=()):
     """Pass 1: per-frame OCR boxes of the subtitle band. If the white-pixel layout barely changed since
     the last OCR'd frame, the subtitle is the same and the result is reused (OCR is still forced every
-    --ocr-interval frames)."""
+    --ocr-interval frames). Frames in `keep` are not read at all (no boxes)."""
     t0 = time.time()
     per_frame = []
     min_h = max(8, int(H * args.min_height))
     ref, last, n_ocr, txt = None, -1, 0, ""
     prog = Progress(label, n)
     for i, strip in enumerate(read_frames(src, W, H, band)):
+        if i in keep:
+            per_frame.append([])
+            ref = None  # the first frame after the range is read afresh
+            prog.update(i + 1, txt)
+            continue
         sig = white_pixels(strip[::2, ::2])
         if ref is not None and i - last < args.ocr_interval:
             diff = np.count_nonzero(sig ^ ref)
@@ -118,7 +147,7 @@ def watermark_mask(src, out_dir, W, H, fps, n, args):
     return m
 
 
-def verify_and_fix(src, dst, W, H, fps, n, band, line, cuts, args, ocr, backend, encoder, outlined=None):
+def verify_and_fix(src, dst, W, H, fps, n, band, line, cuts, args, ocr, backend, encoder, outlined=None, keep=frozenset()):
     """Second look at the finished video: OCR its subtitle band again. Whatever is still readable was missed by
     the first pass (OCR lost it, mask too small, ...); it is erased in one more pass that re-encodes only the
     keyframe windows around it and copies the rest of the file. `outlined`: the first pass's judgement of the
@@ -128,11 +157,12 @@ def verify_and_fix(src, dst, W, H, fps, n, band, line, cuts, args, ocr, backend,
     side = getattr(ocr, "set_det_side", lambda s: None)  # a plain OCR function (tests) has no detector size
     side(VERIFY_DET_SIDE)
     try:
-        per_frame = run_ocr(dst, W, H, n, band, ocr, args, label="verify")
+        per_frame = run_ocr(dst, W, H, n, band, ocr, args, label="verify", keep=keep)
     finally:
         side(DET_SIDE)
     _, segs = segments_from_ocr(per_frame, fps, max_gap=args.max_gap, min_dur=args.min_dur * 0.5, line=line,
-                                keep_edges=getattr(args, "split_part", False), outlined=outlined)
+                                keep_edges=getattr(args, "split_part", False), outlined=outlined,
+                                bridge=round(args.bridge_sec * fps))
     if not segs:
         log("  verify: no subtitle left in the result")
         return
@@ -140,10 +170,13 @@ def verify_and_fix(src, dst, W, H, fps, n, band, line, cuts, args, ocr, backend,
         + ", ".join(fmt_time(s.start / fps) for s in segs[:20]) + (" ..." if len(segs) > 20 else "") + "; erasing")
     if args.mask == "glyph":
         masks = glyph_masks(dst, W, H, band, segs, args.dilate, args.grow, args.shadow, total=n,
-                            extend=round(args.extend_sec * fps))
+                            extend=round(args.extend_sec * fps), outlined=bool(outlined))
     else:
         masks = box_masks(segs, H, W, args.dilate)
     frame_seg, masks = frame_masks(segs, masks, args.pad_frames)
+    frame_seg = {i: k for i, k in frame_seg.items() if i not in keep}
+    if not frame_seg:
+        return
     tmp = dst.with_name("." + dst.stem.lstrip(".") + ".fix.mp4")
 
     def fix(frames, a, b):  # one keyframe-aligned window; indices relative to its first frame
@@ -152,7 +185,9 @@ def verify_and_fix(src, dst, W, H, fps, n, band, line, cuts, args, ocr, backend,
         return stabilize(backend.erase(frames, fs, masks, cw), fs, masks, cw, args.stabilize, label="verify")
 
     # only the windows around the residual subtitles are re-encoded; the rest of the file is copied untouched
-    rewrite(dst, src, tmp, [(min(r), max(r)) for r in _runs(frame_seg)], fix, encoder, args.crf)
+    matrix = can_compose_yuv(dst) if getattr(args, "compose", "auto") != "off" else None
+    compose = (matrix, _erase_regions(frame_seg, masks, None, 0)) if matrix else None
+    rewrite(dst, src, tmp, [(min(r), max(r)) for r in _runs(frame_seg)], fix, encoder, args.crf, compose=compose)
     tmp.replace(dst)
 
 
@@ -175,6 +210,9 @@ def process(src, out_dir, args, ocr, backend, encoder):
         n = packet_count(src) or n
     band = parse_band(args.band, H)
     log(f"\n==> {src.name}  {W}x{H} {fps:.3f}fps  ~{n} frames  subtitle band y={band[0]}-{band[1]}")
+    keep = frozenset(keep_frames(getattr(args, "keep_ranges", ""), fps, n))
+    if keep:
+        log(f"  {len(keep)} frames are left as they are (--keep-ranges {args.keep_ranges}): no OCR, no erasing there")
 
     dst, srt, tmp = output_paths(src, out_dir)
     if args.subtitles == "off":  # watermark only: no OCR, no SRT, no subtitle masks
@@ -188,7 +226,7 @@ def process(src, out_dir, args, ocr, backend, encoder):
             per_frame = json.loads(cache.read_text(encoding="utf-8"))
             log(f"  using OCR cache {cache}")
         else:
-            per_frame = run_ocr(src, W, H, n, band, ocr, args)
+            per_frame = run_ocr(src, W, H, n, band, ocr, args, keep=keep)
             cache.parent.mkdir(exist_ok=True)
             cache.write_text(json.dumps(per_frame, ensure_ascii=False), encoding="utf-8")
         outlined = outlined_subtitles(per_frame, subtitle_line(per_frame))
@@ -196,7 +234,8 @@ def process(src, out_dir, args, ocr, backend, encoder):
             log("  subtitles are white with a dark outline: other text in the picture is left alone")
         # a part of a --jobs split: a subtitle cut by the split is short here but not noise, keep it at the edges
         line, segs = segments_from_ocr(per_frame, fps, max_gap=args.max_gap, min_dur=args.min_dur,
-                                       keep_edges=getattr(args, "split_part", False), outlined=outlined)
+                                       keep_edges=getattr(args, "split_part", False), outlined=outlined,
+                                       bridge=round(args.bridge_sec * fps))
         if line:
             log(f"  subtitle line y~{line[0]:.0f}, text height ~{line[1]:.0f}px")
         write_srt(segs, fps, srt, offset=video_offset(src))
@@ -211,10 +250,11 @@ def process(src, out_dir, args, ocr, backend, encoder):
     else:
         if args.mask == "glyph":
             masks = glyph_masks(src, W, H, band, segs, args.dilate, args.grow, args.shadow, total=n,
-                                extend=round(args.extend_sec * fps))
+                                extend=round(args.extend_sec * fps), outlined=bool(outlined))
         else:
             masks = box_masks(segs, H, W, args.dilate)
         frame_seg, masks = frame_masks(segs, masks, args.pad_frames)
+        frame_seg = {i: k for i, k in frame_seg.items() if i not in keep}  # a subtitle at the edge of a kept range
         log(f"  {args.mask} masks done ({time.time() - t0:.0f}s)")
 
     cuts = []
@@ -235,7 +275,7 @@ def process(src, out_dir, args, ocr, backend, encoder):
         log(f"  video -> {dst}  ({time.time() - t0:.0f}s, {backend.name})")
         if args.verify == "on" and args.subtitles == "on":
             t0 = time.time()
-            verify_and_fix(src, tmp, W, H, fps, n, band, line, cuts, args, ocr, backend, encoder, outlined)
+            verify_and_fix(src, tmp, W, H, fps, n, band, line, cuts, args, ocr, backend, encoder, outlined, keep)
             log(f"  verify done ({time.time() - t0:.0f}s)")
         shift = restore_start(src, tmp)  # last: verify's partial re-encode counts frames from time 0
         if shift:
@@ -249,11 +289,44 @@ def process(src, out_dir, args, ocr, backend, encoder):
         raise
 
 
+def _erase_regions(frame_seg, masks, wm, guard):
+    """frame index -> where the erasing may have changed pixels (yuvcomp.region_of crops), for the frames that have any"""
+    by_key, wm_region = {}, None
+    if wm is not None and wm.any():
+        ys, xs = np.nonzero(wm)
+        y0, x0 = int(ys.min()), int(xs.min())
+        wm_region = yuvcomp.region_of((y0, x0, wm[y0:ys.max() + 1, x0:xs.max() + 1]), yuvcomp.GROW + max(0, guard))
+
+    def of(i):
+        out = []
+        k = frame_seg.get(i)
+        if k is not None:
+            if k not in by_key:
+                by_key[k] = yuvcomp.region_of(masks.crop(k) if hasattr(masks, "crop") else _crop_of(masks[k]))
+            out.append(by_key[k])
+        if wm_region is not None:
+            out.append(wm_region)
+        return out
+    return of
+
+
+def _crop_of(m):
+    ys, xs = np.nonzero(m)
+    if not len(ys):
+        return 0, 0, np.zeros((0, 0), bool)
+    return int(ys.min()), int(xs.min()), m[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+
+
 def _erase_and_encode(src, dst, W, H, fps, n, frame_seg, masks, cuts, wm, args, backend, encoder):
-    wr = open_writer(src, dst, W, H, fps, encoder, args.crf)
+    # The result is composed in the source's own YUV when that is possible (8-bit 4:2:0, limited range, known matrix):
+    # untouched pixels never go through RGB (yuvcomp). --compose off: encode the erased BGR frames as a whole.
+    matrix = can_compose_yuv(src) if getattr(args, "compose", "auto") != "off" else None
+    wr = open_writer(src, dst, W, H, fps, encoder, args.crf, yuv=bool(matrix))
     tw = ThreadedWriter(wr)  # encoding overlaps with the next frame's inference
     written = 0
     stream = None
+    yuv_stream = None
+    regions = _erase_regions(frame_seg, masks, wm, args.wm_guard) if matrix else None
     # relative cost per frame for the ETA (A10 measurements, ms): pass-through ~7, watermark ~39, subtitle frame ~147
     cost = np.full(n + 1, 7.0 + (39.0 if wm is not None else 0.0))
     cost[[i for i in frame_seg if i <= n]] += 147.0
@@ -265,6 +338,9 @@ def _erase_and_encode(src, dst, W, H, fps, n, frame_seg, masks, cuts, wm, args, 
         # picture was 1.5 s late against the audio. Decoding is passthrough now (video._cfr); the cap stays as a
         # safety net
         stream = prefetch(read_frames(src, W, H, count=n))
+        if matrix:
+            yuv_stream = prefetch(read_yuv(src, W, H, count=n))  # the same frames, unconverted, in step with the BGR ones
+            log("  composing in the source's YUV: pixels that are not erased stay as they were")
         wm_frames = all_frames(n)
         if wm is not None:  # watermark: the same erase() on every frame; chained lazily, so still one decode + one encode
             log("  erasing watermark on every frame")
@@ -276,12 +352,20 @@ def _erase_and_encode(src, dst, W, H, fps, n, frame_seg, masks, cuts, wm, args, 
             stream = stabilize(backend.erase(stream, frame_seg, masks, cuts), frame_seg, masks, cuts, args.stabilize,
                                label="subtitles")
         for frame in stream:
-            tw.write(np.ascontiguousarray(frame).tobytes())
+            if matrix:
+                yuv = next(yuv_stream, None)
+                if yuv is None:
+                    raise RuntimeError(f"the YUV decode ended after {written} frames, the BGR decode went on")
+                tw.write(yuvcomp.compose(yuv, frame, regions(written), matrix, W, H))
+            else:
+                tw.write(np.ascontiguousarray(frame).tobytes())
             written += 1
             prog.update(written)
     finally:
         if stream is not None:
             stream.close()  # stops the decoder thread and ffmpeg if we got here through an error
+        if yuv_stream is not None:
+            yuv_stream.close()
         tw.close()
     if wr.returncode != 0:
         raise RuntimeError(f"ffmpeg encoding failed (code {wr.returncode})")

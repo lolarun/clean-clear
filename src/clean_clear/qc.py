@@ -72,6 +72,7 @@ def measure(path):
     return {
         "width": v.get("width"), "height": v.get("height"),
         "frame_rate": round(_rate(v.get("avg_frame_rate")) or 0, 4),
+        "frame_rate_exact": v.get("avg_frame_rate"),  # "24000/1001": compared as written, not as a number
         "frames": packet_count(path),
         "sar": _ratio(v.get("sample_aspect_ratio")), "dar": v.get("display_aspect_ratio"),
         "codec": v.get("codec_name"), "pix_fmt": v.get("pix_fmt"), "container": f.get("format_name"),
@@ -201,8 +202,10 @@ def check(src, dst, out_dir=None, srt=None, sheets=True):
     add("frames", s["frames"] == r["frames"], f"source {s['frames']}, result {r['frames']}")
     add("resolution", (s["width"], s["height"]) == (r["width"], r["height"]),
         f"source {s['width']}x{s['height']}, result {r['width']}x{r['height']}")
-    add("frame_rate", s["frame_rate"] and abs(r["frame_rate"] - s["frame_rate"]) <= 1e-4 * s["frame_rate"],
-        f"source {s['frame_rate']}, result {r['frame_rate']}")
+    # the rate as the file states it: 24000/1001 and 991001/41333 are 1e-7 apart as numbers, but not the same rate
+    add("frame_rate", s["frame_rate"] and s["frame_rate_exact"] == r["frame_rate_exact"]
+        and abs(r["frame_rate"] - s["frame_rate"]) <= 1e-4 * s["frame_rate"],
+        f"source {s['frame_rate_exact']} ({s['frame_rate']}), result {r['frame_rate_exact']} ({r['frame_rate']})")
     add("aspect", s["sar"] == r["sar"], f"SAR source {s['sar']}, result {r['sar']} (DAR {s['dar']} / {r['dar']})")
     diff = {k: (s["color"][k], r["color"][k]) for k in s["color"] if s["color"][k] and s["color"][k] != r["color"][k]}
     add("colour", not diff, "same" if not diff else f"source/result differ: {diff}")

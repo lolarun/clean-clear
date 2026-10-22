@@ -146,6 +146,9 @@ Rules behind the suggestions: subtitles count as present when text sits on one c
 | `--ocr-fixed-shape` | `auto` | feed OCR recognition one fixed input shape; works around multi-second stalls per new input shape observed on an RTX 5090 with onnxruntime-gpu 1.23 (`auto` = on for compute capability 12+ with onnxruntime 1.23 or newer; with 1.22 it only made OCR 3x slower) |
 | `--ffmpeg-threads` | `auto` | threads per ffmpeg decoder/encoder; `auto` = half of the process's CPU share (the CPU quota divided by the part processes), `0` = ffmpeg's own default (sized from the host's core count, which overran a container quota) |
 | `--max-gap` | `5` | missed frames tolerated within one subtitle |
+| `--bridge-sec` | `1.0` | OCR lost a subtitle's text for up to this long and then reads the very same text in the same place: one subtitle. Gap frames that show no subtitle are not erased (`0` = only `--max-gap`) |
+| `--keep-ranges` | none | parts of the film left as they are: no OCR, no erasing, no cues in the SRT (opening title and credits, closing credits), e.g. `0-95,1:28:00-end`; per video in a `--list` file |
+| `--qc-subtitles` | off | `clean-clear --qc-subtitles SOURCE RESULT [-o DIR] [--srt FILE]`: look for subtitles still on screen (calibration, five frames per SRT cue, a blind scan every second, logos); writes `report.md`, `findings.csv`, `evidence/` and contact sheets; exit code 1 = leftovers, 2 = a person must decide |
 | `--min-score` | `0.6` | OCR confidence threshold |
 | `--extend-sec` | `3` | when OCR loses a subtitle for part of its time, keep erasing up to this many seconds before/after it while its glyphs are still visible; `0` = off |
 | `--verify` | `on` | after erasing, OCR the result again and erase any subtitle that is still readable (adds one cheap OCR pass; a second decode/encode only if something is found) |

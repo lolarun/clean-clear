@@ -85,6 +85,8 @@ class Seg:
     boxes: list = field(default_factory=list)  # (x0, y0, x1, y1) in full-frame coordinates
     ext_lo: int = None  # first/last frame where the same glyphs are still on screen although OCR lost them
     ext_hi: int = None
+    gaps: list = field(default_factory=list)  # (first, last) frames where OCR lost the text and the two sides were joined
+    skip: set = field(default_factory=set)  # frames of those gaps that show no subtitle (masks.glyph_masks): not erased
 
     @property
     def span(self):
@@ -226,16 +228,38 @@ def _x_overlap(a, b):
     return min(ax1, bx1) - max(ax0, bx0) > 0.4 * min(ax1 - ax0, bx1 - bx0)
 
 
-def build_segments(per_frame, max_gap, min_len, keep_edges=False):
+def _same_line_place(boxes_a, boxes_b):
+    """Do two sets of boxes (one frame's, or a run's) sit in the same place: the same horizontal extent (80 % of the
+    narrower) and the same height of the line (centres within half a text height)?"""
+    if not boxes_a or not boxes_b:
+        return False
+    ax0, ax1 = min(b[0] for b in boxes_a), max(b[2] for b in boxes_a)
+    bx0, bx1 = min(b[0] for b in boxes_b), max(b[2] for b in boxes_b)
+    if min(ax1, bx1) - max(ax0, bx0) < 0.8 * min(ax1 - ax0, bx1 - bx0):
+        return False
+    h = float(np.median([b[3] - b[1] for b in boxes_a]))
+    ya = float(np.median([(b[1] + b[3]) / 2 for b in boxes_a]))
+    yb = float(np.median([(b[1] + b[3]) / 2 for b in boxes_b]))
+    return abs(ya - yb) <= 0.5 * h
+
+
+def build_segments(per_frame, max_gap, min_len, keep_edges=False, bridge=0):
     """per_frame: [(text, boxes)] -> [Seg]. keep_edges: also keep short segments that touch the first or last frame
-    (a subtitle cut in two where a long video was split for --jobs is not noise)"""
+    (a subtitle cut in two where a long video was split for --jobs is not noise).
+    bridge: frames of OCR dropout tolerated within one subtitle, when the same text comes back in the same place
+    (max_gap applies otherwise). 1304 at 12:29: "行行行" was read for 10 frames, lost for 13 behind a sign that
+    slid past, read again for 2 frames - which were dropped as noise and stayed on screen."""
+    bridge = max(bridge, max_gap)
     # 1) Consecutive frames with identical text (ignoring spaces) -> runs
     runs = []
     for i, (text, boxes) in enumerate(per_frame):
         if not text:
             continue
         r = runs[-1] if runs else None
-        if r and i - r.end <= max_gap + 1 and r.text.replace(" ", "") == text.replace(" ", ""):
+        if (r and r.text.replace(" ", "") == text.replace(" ", "")
+                and (i - r.end <= max_gap + 1 or (i - r.end <= bridge + 1 and _same_line_place(r.boxes, boxes)))):
+            if i - r.end > max_gap + 1:
+                r.gaps.append((r.end + 1, i - 1))
             r.end = i
             r.texts[text] += 1
             r.boxes += boxes
@@ -247,10 +271,19 @@ def build_segments(per_frame, max_gap, min_len, keep_edges=False):
     segs = []
     for r in runs:
         p = segs[-1] if segs else None
-        if p and r.start - p.end <= max_gap + 1 and _x_overlap(p, r):
+        if p and r.start - p.end <= bridge + 1 and _x_overlap(p, r):
             s = similar(p.text, r.text)
             rl, pl = r.end - r.start + 1, p.end - p.start + 1
-            if s >= 0.9 or (s >= 0.6 and min(rl, pl) < short) or (_contains(p.text, r.text) and _same_place(p, r)):
+            if r.start - p.end <= max_gap + 1:
+                join = (s >= 0.9 or (s >= 0.6 and min(rl, pl) < short)
+                        or (_contains(p.text, r.text) and _same_place(p, r)))
+            else:  # a longer dropout: only the very same text, in the same place ("卖什么油桃" and "还卖什么油桃" 0.7 s
+                # apart are two subtitles with a blank between them, and similar enough for s >= 0.9)
+                join = (p.text.replace(" ", "") == r.text.replace(" ", "")) and _same_line_place(p.boxes, r.boxes)
+                if join:
+                    p.gaps.append((p.end + 1, r.start - 1))
+            if join:
+                p.gaps += r.gaps
                 p.end = r.end
                 p.texts.update(r.texts)
                 p.boxes += r.boxes
@@ -286,7 +319,7 @@ def outlined_subtitles(per_frame, line):
     return good >= 25 and good >= 0.5 * len(scores)
 
 
-def segments_from_ocr(per_frame, fps, max_gap=5, min_dur=0.4, line="auto", keep_edges=False, outlined=None):
+def segments_from_ocr(per_frame, fps, max_gap=5, min_dur=0.4, line="auto", keep_edges=False, outlined=None, bridge=0):
     """Raw per-frame OCR boxes -> (subtitle line, [Seg]). `line` = a known (y centre, height) to reuse
     instead of detecting it, e.g. when checking an already cleaned video where almost no text is left.
     outlined=True (outlined_subtitles): boxes that do not look like a subtitle are dropped first. Titles, credits,
@@ -297,7 +330,8 @@ def segments_from_ocr(per_frame, fps, max_gap=5, min_dur=0.4, line="auto", keep_
     if line == "auto":
         line = subtitle_line(per_frame)
     texts = [join_text(filter_line(list(b), line)) for b in per_frame]
-    return line, build_segments(texts, max_gap=max_gap, min_len=max(2, round(min_dur * fps)), keep_edges=keep_edges)
+    return line, build_segments(texts, max_gap=max_gap, min_len=max(2, round(min_dur * fps)), keep_edges=keep_edges,
+                                bridge=bridge)
 
 
 def ts(sec):

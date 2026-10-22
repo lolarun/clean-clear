@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .common import __version__, fmt_time, log, usable_cpus
 from .device import gpu_memory_gb
-from .pipeline import output_paths, watermark_cache_path, watermark_mask
+from .pipeline import output_paths, parse_keep, watermark_cache_path, watermark_mask
 from .subtitles import similar
 from .video import _exe, duration_check, packet_count, probe, restore_start, video_offset
 
@@ -24,7 +24,7 @@ from .video import _exe, duration_check, packet_count, probe, restore_start, vid
 _VALUE_OPTS = ["model", "subtitles", "band", "device", "ocr_interval", "ocr_fixed_shape", "encoder", "crf", "mask", "dilate",
                "grow", "shadow", "pad_frames", "max_gap", "min_dur", "min_score", "min_height", "extend_sec",
                "verify", "wm_guard", "stabilize", "propainter_dir", "pp_chunk", "pp_raft_iter", "pp_ctx", "pp_pad",
-               "pp_margin", "pp_ref_stride", "ffmpeg_threads"]
+               "pp_margin", "pp_ref_stride", "ffmpeg_threads", "bridge_sec", "compose"]
 _SRT_TIME = re.compile(r"(\d+):(\d\d):(\d\d),(\d{3}) --> (\d+):(\d\d):(\d\d),(\d{3})")
 
 
@@ -78,10 +78,23 @@ def _child_args(args, wm):
     cmd = []
     for name in _VALUE_OPTS:
         cmd += ["--" + name.replace("_", "-"), str(getattr(args, name))]
+    cmd += ["--keep-ranges", getattr(args, "keep_ranges", "")]  # the film's; each part gets its own piece (_part_keeps)
     cmd += ["--watermark", wm, "--split-part", "--jobs", "1"]  # a part is never split again
     if args.no_cache:
         cmd.append("--no-cache")
     return cmd
+
+
+def _part_keeps(spec, files, fps, duration):
+    """The film's --keep-ranges as every part sees them: the pieces inside the part, on the part's own clock"""
+    ranges = parse_keep(spec, duration)
+    out, start = [], 0.0
+    for f in files:
+        end = start + (packet_count(f) or 0) / fps
+        local = [(max(a, start) - start, min(b, end) - start) for a, b in ranges if a < end and b > start]
+        out.append(",".join(f"{a:.3f}-{b:.3f}" for a, b in local))
+        start = end
+    return out
 
 
 def _fmt_ms(ms):
@@ -260,7 +273,7 @@ def _kill(p, fh=None):
         fh.close()
 
 
-def _run_parts(args, files, work, wm, groups, pending, t_all, on_done=None):
+def _run_parts(args, files, work, wm, groups, pending, t_all, on_done=None, keeps=None):
     jobs = args.jobs
     cap = jobs  # processes at a time; lowered when one runs out of GPU memory
     running = {}  # slot -> (part index, Popen, log file)
@@ -274,6 +287,8 @@ def _run_parts(args, files, work, wm, groups, pending, t_all, on_done=None):
                 odir = work / f"out{k:02d}"
                 _clean_part_dir(odir)
                 cmd = [sys.executable, "-m", "clean_clear", str(files[k]), "-o", str(odir)] + _child_args(args, wm)
+                if keeps is not None:
+                    cmd += ["--keep-ranges", keeps[k]]  # the last --keep-ranges wins: this part's own piece
                 pin = (lambda c=groups[slot]: os.sched_setaffinity(0, c)) if groups[slot] else None
                 fh = open(work / f"part{k:02d}.out", "w")
                 # each part plans its thread pools (video.ffmpeg_threads) for its share of the CPU quota
@@ -382,7 +397,8 @@ def _process_parallel(src, out_dir, args, W, H, fps, n, duration):
         stop_mps = start_mps(args.mps)
         try:
             _run_parts(args, files, work, wm, groups, pending, t_all,
-                       on_done=lambda k: (work / f"out{k:02d}" / ".done").write_text(key))
+                       on_done=lambda k: (work / f"out{k:02d}" / ".done").write_text(key),
+                       keeps=_part_keeps(getattr(args, "keep_ranges", ""), files, fps, duration))
         finally:
             stop_mps()
 

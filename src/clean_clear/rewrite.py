@@ -12,8 +12,9 @@ from pathlib import Path
 
 import numpy as np
 
+from . import yuvcomp
 from .common import log
-from .video import ThreadedWriter, _exe, keyframes, open_writer, probe, read_frames
+from .video import ThreadedWriter, _exe, keyframes, open_writer, probe, read_frames, read_yuv
 
 
 def windows_for(ranges, kfs, n, margin):
@@ -29,9 +30,11 @@ def windows_for(ranges, kfs, n, margin):
     return out
 
 
-def rewrite(video, audio_src, dst, ranges, process, encoder, crf, margin=40):
+def rewrite(video, audio_src, dst, ranges, process, encoder, crf, margin=40, compose=None):
     """Write `dst` = `video` with the frames around `ranges` replaced by process(frames, a, b) (an iterator of the
-    frames a..b-1, already processed). The audio is copied from `audio_src`. Returns the windows rewritten."""
+    frames a..b-1, already processed). The audio is copied from `audio_src`. Returns the windows rewritten.
+    compose = (matrix, regions): the windows are composed in the video's own YUV (yuvcomp), only the pixels of
+    regions(absolute frame index) are taken from the processed frame, everything else stays as it was."""
     video, dst = Path(video), Path(dst)
     if not plain_timeline(video):
         raise NotPlainTimeline(f"{video.name} has hidden or out-of-range frames (e.g. a stream-copy cut); "
@@ -48,14 +51,23 @@ def rewrite(video, audio_src, dst, ranges, process, encoder, crf, margin=40):
         if a > pos:
             pieces.append((_copy(video, work / f"c{j:03d}.mp4", kft.get(pos), a - pos), a - pos))
         chunk = work / f"w{j:03d}.mp4"
-        wr = open_writer(video, chunk, W, H, fps, encoder, crf, audio=False)
+        wr = open_writer(video, chunk, W, H, fps, encoder, crf, audio=False, yuv=compose is not None)
         tw = ThreadedWriter(wr)
         written = 0
+        yuv_it = read_yuv(video, W, H, start=a, count=b - a) if compose else None
         try:
             for f in process(read_frames(video, W, H, start=a, count=b - a), a, b):
-                tw.write(np.ascontiguousarray(f).tobytes())
+                if compose:
+                    yuv = next(yuv_it, None)
+                    if yuv is None:
+                        raise RuntimeError(f"the YUV decode of frames {a}-{b} ended after {written} frames")
+                    tw.write(yuvcomp.compose(yuv, f, compose[1](a + written), compose[0], W, H))
+                else:
+                    tw.write(np.ascontiguousarray(f).tobytes())
                 written += 1
         finally:
+            if yuv_it is not None:
+                yuv_it.close()
             tw.close()
         if wr.returncode != 0 or written != b - a:
             raise RuntimeError(f"rewrite of frames {a}-{b} failed (encoder code {wr.returncode}, {written} frames)")

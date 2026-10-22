@@ -49,7 +49,7 @@ def _stream_info(path):
     out = subprocess.run(
         [_exe("ffprobe"), "-v", "error", "-select_streams", "v:0", "-show_entries",
          "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,color_space,color_primaries,color_transfer,"
-         "color_range,sample_aspect_ratio:format=duration", "-of", "json", str(path)],
+         "color_range,sample_aspect_ratio,pix_fmt:format=duration", "-of", "json", str(path)],
         capture_output=True, check=True).stdout
     j = json.loads(out)
     return j["streams"][0], float(j["format"].get("duration", 0) or 0)
@@ -210,6 +210,38 @@ def read_frames(path, w, h, crop=None, start=0, count=0):
             if len(buf) < size:
                 break
             yield np.frombuffer(buf, np.uint8).reshape(h, w, 3)
+    finally:
+        _stop(p)
+
+
+def can_compose_yuv(path):
+    """Can a result be composed in the source's own YUV (yuvcomp)? -> the matrix name, or None (8-bit 4:2:0, limited range,
+    a known matrix, even size: otherwise the erased BGR frames are encoded as a whole, as before)"""
+    from . import yuvcomp
+    s, _ = _stream_info(path)
+    m, rng, _ = colour(path)
+    ok = yuvcomp.supported(m, s.get("pix_fmt"), rng, int(s["width"]), int(s["height"]))
+    return m if ok else None
+
+
+def read_yuv(path, w, h, count=0, start=0):
+    """Yield the decoder's frames as flat uint8 arrays of yuv420p (w*h*3/2 values), no conversion; frame for frame what
+    read_frames() yields as BGR (same options, also start/count)"""
+    cmd = [_exe("ffmpeg"), "-v", "error", *_threads_opts()]
+    if start:
+        cmd += ["-ss", f"{(start - 0.25) / _fps(path):.6f}"]
+    cmd += ["-i", str(path), "-map", "0:v:0", *_cfr(path)]
+    if count:
+        cmd += ["-frames:v", str(count)]
+    cmd += ["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=w * h * 3 * 2)
+    size = w * h * 3 // 2
+    try:
+        while True:
+            buf = p.stdout.read(size)
+            if len(buf) < size:
+                break
+            yield np.frombuffer(buf, np.uint8)
     finally:
         _stop(p)
 
@@ -402,8 +434,23 @@ def keyframes(path):
     return {round((float(t) - v0) * fps): t for t in times}
 
 
-def open_writer(src, dst, w, h, fps, encoder, crf, audio=True):
-    """ffmpeg process that encodes raw BGR frames from stdin and copies the audio of `src` (audio=False: video only)."""
+def _exact_rate(src, fps):
+    """The frame rate to tell the encoder: the source's own rate string ("24000/1001") when `fps` is that rate, else
+    `fps` with six decimals. The decimal 23.976024 of an NTSC rate was turned into 991001/41333 by ffmpeg (29.97 into
+    979001/32666, 59.94 into 979001/16333): the picture was right, but the result stated another rate than the source."""
+    try:
+        s, dur = _stream_info(src)
+        value, rate = _timing(s, dur)[:2]
+        if rate and abs(value - fps) <= 1e-4 * fps:
+            return rate
+    except Exception:
+        pass
+    return f"{fps:.6f}"
+
+
+def open_writer(src, dst, w, h, fps, encoder, crf, audio=True, yuv=False):
+    """ffmpeg process that encodes raw BGR frames from stdin and copies the audio of `src` (audio=False: video only).
+    yuv=True: the frames are yuv420p already (yuvcomp.compose) in the source's matrix and range: no conversion."""
     if encoder in ("h264_nvenc", "hevc_nvenc"):
         venc = ["-c:v", encoder, "-preset", "p5", "-rc", "vbr", "-cq", str(crf), "-b:v", "0"]
     else:
@@ -413,10 +460,17 @@ def open_writer(src, dst, w, h, fps, encoder, crf, audio=True):
     n = ffmpeg_threads()
     if n:
         venc += ["-threads", str(n)]
+    # a raw YUV input says what its frames are (matrix, range): untagged, ffmpeg takes them for something else and
+    # converts them to the colour description of the output (a tagged BT.709 film changed by 21 grey levels on average)
     cmd = [_exe("ffmpeg"), "-v", "error", "-y", *(["-filter_threads", str(n)] if n else []),
-           "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", f"{fps:.6f}", "-i", "-"]
+           "-f", "rawvideo", *(tags if yuv else []), "-pix_fmt", "yuv420p" if yuv else "bgr24", "-s", f"{w}x{h}",
+           "-r", _exact_rate(src, fps), "-i", "-"]
     cmd += ["-i", str(src), *SWS, "-map", "0:v:0", "-map", "1:a?", "-c:a", "copy"] if audio else [*SWS, "-map", "0:v:0"]
-    cmd += ["-vf", f"scale=flags={SWS_FLAGS}:in_range=pc:out_color_matrix={m}:out_range={rng},format=yuv420p"
-                   + (f",setsar={aspect}" if aspect else "")]
+    if yuv:
+        if aspect:
+            cmd += ["-vf", f"setsar={aspect}"]
+    else:
+        cmd += ["-vf", f"scale=flags={SWS_FLAGS}:in_range=pc:out_color_matrix={m}:out_range={rng},format=yuv420p"
+                       + (f",setsar={aspect}" if aspect else "")]
     cmd += [*venc, *tags, "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(dst)]
     return subprocess.Popen(cmd, stdin=subprocess.PIPE)

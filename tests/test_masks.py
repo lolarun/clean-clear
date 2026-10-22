@@ -138,3 +138,40 @@ def test_outline_score_tells_a_subtitle_from_other_text():
     title[10:50, 20:180] = (30, 30, 230)  # red title: no white at all
     assert M.outline_score(sub) > 0.6
     assert M.outline_score(sign) < 0.1 and M.outline_score(title) == 0.0
+
+
+def _outlined_strips(n, lit):
+    """frames in `lit` show outlined white strokes in the box (cols 250-390, rows 60-80 of the band); the rest is plain"""
+    for i in range(n):
+        s = np.full((BAND[1] - BAND[0], W, 3), (160, 96, 48), np.uint8)
+        if i in lit:
+            for x in range(250, 386, 12):
+                s[58:82, x - 2:x + 6] = 0
+                s[60:80, x:x + 4] = 255
+        yield s
+
+
+def test_gap_frames_without_a_subtitle_are_not_erased_and_do_not_dilute_the_glyphs(monkeypatch):
+    # two reads of the same subtitle joined across 15 frames of OCR dropout; the picture shows no text in the gap
+    # only 10 of the 30 frames show text (5 before the gap, 5 after): the vote is over those 10, not over 30 - with 30 the
+    # strokes (white in all 10) would miss the "more than half" and the mask would fall back to the whole box
+    monkeypatch.setattr(M, "read_frames", lambda *a, **k: _outlined_strips(40, set(range(0, 5)) | set(range(25, 30))))
+    s = seg(0, 29, (245, 295, 395, 325))
+    s.gaps = [(5, 24)]
+    m = glyph_masks("x", W, H, BAND, [s], dilate=4, grow=3, shift=2, outlined=True)[0]
+    assert m[300:320, 252:256].all()                  # a stroke
+    assert not m[291:295, 250:390].any()              # rows above the strokes that only the whole box (+4) would cover
+    assert s.skip == set(range(5, 25))
+    fs, _ = M.frame_masks([s], {0: m}, pad=1)
+    assert 4 in fs and 25 in fs and not any(i in fs for i in range(6, 24))
+
+
+def test_gap_frames_that_show_the_subtitle_are_erased(monkeypatch):
+    # OCR lost the text (a bright sign behind it), the picture still shows the subtitle: erased like the rest
+    monkeypatch.setattr(M, "read_frames", lambda *a, **k: _outlined_strips(40, set(range(0, 35))))
+    s = seg(0, 34, (245, 295, 395, 325))
+    s.gaps = [(10, 24)]
+    glyph_masks("x", W, H, BAND, [s], dilate=4, grow=3, shift=2, outlined=True)
+    assert s.skip == set()
+    fs, _ = M.frame_masks([s], {0: np.zeros((H, W), bool)}, pad=1)
+    assert all(i in fs for i in range(0, 36))

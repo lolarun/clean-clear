@@ -120,3 +120,12 @@ def test_the_plan_key_follows_source_options_and_version(tmp_path):
     assert key != parallel._plan_key(src, 8, a, "/m.png")
     b = build_argparser().parse_args([str(src), "--grow", "9"])
     assert key != parallel._plan_key(src, 8, b, "off")
+
+
+def test_keep_ranges_of_the_film_become_the_pieces_of_each_part(monkeypatch):
+    counts = {"p0": 3000, "p1": 3000, "p2": 3000}      # three parts of 120 s at 25 fps
+    monkeypatch.setattr(parallel, "packet_count", lambda f: counts[f])
+    specs = parallel._part_keeps("0-95,200-end", ["p0", "p1", "p2"], 25.0, 360.0)
+    # 360 s film: parts [0,120) [120,240) [240,360); the ranges are 0-95 and 200-end (= 360)
+    assert specs == ["0.000-95.000", "80.000-120.000", "0.000-120.000"]
+    assert parallel._part_keeps("", ["p0"], 25.0, 120.0) == [""]

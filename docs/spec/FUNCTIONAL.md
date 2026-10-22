@@ -156,6 +156,9 @@ clean-clear [INPUT ...] [-o OUT] [-m propainter|lama] [options]
 | `--dilate`, `--grow`, `--shadow` | `10`, `8`, `3` | Box dilation, glyph dilation, shadow offset (px) |
 | `--pad-frames` | `1` | Extra frames erased around each subtitle |
 | `--max-gap`, `--min-dur` | `5`, `0.4` | Merging tolerance (frames), minimum duration (s) |
+| `--bridge-sec` | `1.0` | Dropout of the OCR within one subtitle tolerated when the very same text comes back in the same place (s); the gap frames without a subtitle are not erased |
+| `--keep-ranges` | none | `START-END[,START-END...]`: parts of the film left as they are (credits); no OCR, no erasing, no cues there |
+| `--qc-subtitles` | off | Subtitle residue check of a result against its source (SOURCE RESULT, `--srt`, `-o`); see `src/clean_clear/subtitle_qc.py` |
 | `--min-score`, `--min-height` | `0.6`, `0.015` | OCR confidence, minimum text height (fraction of frame height) |
 | `--propainter-dir` | `$PROPAINTER_DIR` or `./ProPainter` | ProPainter checkout with `weights/` |
 | `--pp-chunk` | `120` | Frames per ProPainter chunk; lower on small GPUs (60–80 for 8 GB) |
