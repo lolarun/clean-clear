@@ -159,6 +159,8 @@ clean-clear [INPUT ...] [-o OUT] [-m propainter|lama] [options]
 | `--bridge-sec` | `1.0` | Dropout of the OCR within one subtitle tolerated when the very same text comes back in the same place (s); the gap frames without a subtitle are not erased |
 | `--keep-ranges` | none | `START-END[,START-END...]`: parts of the film left as they are (credits); no OCR, no erasing, no cues there |
 | `--qc-subtitles` | off | Subtitle residue check of a result against its source (SOURCE RESULT, `--srt`, `-o`); see `src/clean_clear/subtitle_qc.py` |
+| `--qc-workers` | 0 | OCR processes of the residue check (0 = a quarter of the CPUs, 2-6; 1 = in the main process) |
+| `--compose` | auto | `auto`: untouched pixels are copied from the source YUV (PSNR >= 40 dB outside the erased area); `off`: RGB round trip |
 | `--min-score`, `--min-height` | `0.6`, `0.015` | OCR confidence, minimum text height (fraction of frame height) |
 | `--propainter-dir` | `$PROPAINTER_DIR` or `./ProPainter` | ProPainter checkout with `weights/` |
 | `--pp-chunk` | `120` | Frames per ProPainter chunk; lower on small GPUs (60–80 for 8 GB) |

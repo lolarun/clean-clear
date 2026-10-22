@@ -20,12 +20,13 @@ import re
 import shutil
 import subprocess
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from .common import __version__, log
+from .common import __version__, cpu_share, log
 from .masks import outline_score
 from .qc import read_srt
 from .subtitles import STYLE_MIN
@@ -157,11 +158,61 @@ def calibrate(ocr, video, W, H, n, out_dir):
     return result
 
 
-def learn_subtitle_look(ocr, source, cues, W, H, fps, limit=150):
+_WORKER_OCR = None
+
+
+def _init_worker(spec, side):
+    global _WORKER_OCR
+    from .subtitles import OCR
+    cv2.setNumThreads(1)   # the workers are the parallelism; OpenCV's own thread pools only compete for the CPU quota
+    _WORKER_OCR = OCR(*spec)
+    _WORKER_OCR.set_det_side(side)
+
+
+def _in_worker(fn, *args):
+    return fn(_WORKER_OCR, *args)
+
+
+class Runner:
+    """Runs the OCR jobs of the check here (workers <= 1, or an OCR that cannot be rebuilt) or in `workers` processes
+    that each hold an OCR of their own: one OCR call leaves the GPU and most cores idle."""
+
+    def __init__(self, ocr, workers, side):
+        self.ocr, self.pool = ocr, None
+        spec = getattr(ocr, "spec", None)
+        self.workers = workers if spec else 1
+        if self.workers > 1:
+            import multiprocessing
+            import os
+            from concurrent.futures import ProcessPoolExecutor
+            # the container's CPU quota is shared by the workers: each sizes its ffmpeg threads for its own share
+            os.environ["CLEAN_CLEAR_CPUS"] = str(max(2, cpu_share() // self.workers))
+            self.pool = ProcessPoolExecutor(self.workers, mp_context=multiprocessing.get_context("spawn"),
+                                            initializer=_init_worker, initargs=(spec, side))
+
+    def submit(self, fn, *args):
+        if self.pool:
+            return self.pool.submit(_in_worker, fn, *args)
+        done = Future()
+        done.set_result(fn(self.ocr, *args))
+        return done
+
+    def close(self):
+        if self.pool:
+            self.pool.shutdown()
+
+    def chunks(self, items):
+        """`items` (sorted) in groups of consecutive ones: three per worker, so a slow group does not hold the rest"""
+        k = max(1, min(3 * self.workers, len(items)))
+        size = -(-len(items) // k)
+        return [items[j:j + size] for j in range(0, len(items), size)]
+
+
+def start_learn(runner, source, cues, W, H, fps, limit=150):
     """Where the subtitles are and how they look, from the source: OCR at the middle of up to `limit` cues, the boxes that
-    read like the cue. -> {line_y, line_h, style, outlined, samples}"""
+    read like the cue. Returns the pending jobs for finish_learn."""
     if not cues:
-        return {"samples": 0}
+        return []
     cues = cues[:max(limit, len(cues) // 3)]   # the first third of the film is enough, and ends the read of the source early
     step = max(1, len(cues) // limit)
     want = {}
@@ -169,10 +220,18 @@ def learn_subtitle_look(ocr, source, cues, W, H, fps, limit=150):
         a, b, text = cues[j]
         if len(norm(text)) >= 2:
             want[min(int(((a + b) / 2) * fps), 10 ** 9)] = norm(text)
-    ys, hs, styles, cxs = [], [], [], []
+    if not want:
+        return []
+    return [runner.submit(_learn_chunk, source, W, H, {i: want[i] for i in group})
+            for group in runner.chunks(sorted(want))]
+
+
+def _learn_chunk(ocr, source, W, H, want):
+    """(line centres, heights, outline scores) of the boxes that read like the cue, for the frames in `want` {frame: text}"""
     y0 = int(H * CUE_BAND)
-    last = max(want)
-    for i, strip in enumerate(read_frames(source, W, H, crop=(y0, H))):
+    first, last = min(want), max(want)
+    ys, hs, styles = [], [], []
+    for i, strip in enumerate(read_frames(source, W, H, start=first, count=last - first + 1, crop=(y0, H)), first):
         if i in want:
             for x0, by0, x1, by1, text, score in read_lines(ocr, strip, y0):
                 n = norm(text)
@@ -180,9 +239,17 @@ def learn_subtitle_look(ocr, source, cues, W, H, fps, limit=150):
                     ys.append((by0 + by1) / 2)
                     hs.append(by1 - by0)
                     styles.append(outline_score(strip[by0 - y0:by1 - y0, x0:x1]))
-                    cxs.append((x0 + x1) / 2)
-        if i >= last:
-            break
+    return ys, hs, styles
+
+
+def finish_learn(jobs):
+    """-> {line_y, line_h, style, outlined, samples}"""
+    ys, hs, styles = [], [], []
+    for job in jobs:
+        a, b, c = job.result()
+        ys += a
+        hs += b
+        styles += c
     if not ys:
         return {"samples": 0}
     style = float(np.median(styles))
@@ -202,11 +269,10 @@ def looks_like_subtitle(box, W, look, style):
     return style >= STYLE_MIN if look.get("outlined") else True
 
 
-def scan_result(ocr, result, cues, W, H, fps, n, duration, out_dir):
-    """The frames of the checks, OCR'd in one pass over the result. -> (findings, stats)"""
+def start_scan(runner, result, cues, W, H, fps, n, duration, out_dir):
+    """The frames of the checks (cue frames and the blind scan), OCR'd over the result in groups. -> (pending jobs, stats)"""
     ev = Path(out_dir) / "evidence"
     ev.mkdir(parents=True, exist_ok=True)
-    norms = [norm(c[2]) for c in cues]
     needed = {}
     for j, label, t in cue_frame_times(cues, duration):
         i = min(n - 1, max(0, int(round(t * fps))))
@@ -218,10 +284,30 @@ def scan_result(ocr, result, cues, W, H, fps, n, duration, out_dir):
         needed.setdefault(i, {"cue": [], "blind": False})["blind"] = True
         blind_frames += 1
         k += 1
+    norms = [norm(c[2]) for c in cues]
+    dialogues = [c[2].replace("\n", " / ") for c in cues]
+    jobs = [runner.submit(_scan_chunk, result, W, H, fps, {i: needed[i] for i in group}, str(ev), norms, dialogues)
+            for group in runner.chunks(sorted(needed))]
+    return jobs, {"cue_frames": sum(len(v["cue"]) for v in needed.values()), "blind_frames": blind_frames}
+
+
+def finish_scan(jobs, stats):
+    """-> (findings, stats)"""
+    findings, ocr_frames = [], 0
+    for job in jobs:
+        f, k = job.result()
+        findings += f
+        ocr_frames += k
+    return findings, {**stats, "ocr_frames": ocr_frames}
+
+
+def _scan_chunk(ocr, result, W, H, fps, needed, ev, norms, dialogues):
+    """OCR of the frames in `needed` {frame: {cue, blind}}; the suspect boxes -> (findings, frames read)"""
+    ev = Path(ev)
     y0 = int(H * CUE_BAND)
     findings, ocr_frames = [], 0
-    last = max(needed)
-    for i, strip in enumerate(read_frames(result, W, H, crop=(y0, H))):
+    first, last = min(needed), max(needed)
+    for i, strip in enumerate(read_frames(result, W, H, start=first, count=last - first + 1, crop=(y0, H)), first):
         info = needed.get(i)
         if info:
             ocr_frames += 1
@@ -235,7 +321,7 @@ def scan_result(ocr, result, cues, W, H, fps, n, duration, out_dir):
                     why = suspect(text, around)
                     if why:
                         findings.append({"method": "cue", "frame": i, "t": t_frame, "label": label, "text": text,
-                                         "dialogue": cues[j][2].replace("\n", " / "), "cue": j, "reason": why,
+                                         "dialogue": dialogues[j], "cue": j, "reason": why,
                                          "box": (x0, by0, x1, by1), "score": score,
                                          "style": outline_score(strip[by0 - y0:by1 - y0, x0:x1])})
                         saved = True
@@ -259,28 +345,31 @@ def scan_result(ocr, result, cues, W, H, fps, n, duration, out_dir):
                 cv2.imwrite(str(ev / f"_f{i}.jpg"), strip, [cv2.IMWRITE_JPEG_QUALITY, 90])
         if i >= last:
             break
-    return findings, {"cue_frames": sum(len(v["cue"]) for v in needed.values()), "ocr_frames": ocr_frames,
-                      "blind_frames": blind_frames}
+    return findings, ocr_frames
 
 
-def compare_with_source(findings, source, W, H, result_dir):
+def compare_with_source(findings, source, W, H, result_dir, workers=1):
     """Mean absolute difference between the source and the result inside every suspect box (grey levels, 0-255)"""
     if not findings:
         return
     y0 = int(H * CUE_BAND)
     frames = sorted({f["frame"] for f in findings})
     got = {}
-    if len(frames) <= 150:   # a seek per frame (~0.15 s) is cheaper than decoding the whole film again (~4 s per minute of film)
-        for i in frames:
-            for s in read_frames(source, W, H, start=i, count=1, crop=(y0, H)):
-                got[i] = s.copy()
-    else:
-        want = set(frames)
-        for i, s in enumerate(read_frames(source, W, H, crop=(y0, H))):
+
+    def grab(group):   # one decode over the frames of the group
+        want = set(group)
+        for i, s in enumerate(read_frames(source, W, H, start=group[0], count=group[-1] - group[0] + 1, crop=(y0, H)),
+                              group[0]):
             if i in want:
                 got[i] = s.copy()
-            if i >= frames[-1]:
-                break
+
+    if len(frames) <= 150:   # a seek per frame (~0.15 s) is cheaper than decoding the whole film again (~4 s per minute of film)
+        groups = [[i] for i in frames]
+    else:
+        size = -(-len(frames) // (3 * workers))
+        groups = [frames[j:j + size] for j in range(0, len(frames), size)]
+    with ThreadPoolExecutor(max(1, workers)) as pool:   # ffmpeg does the work, the threads only wait for it
+        list(pool.map(grab, groups))
     for f in findings:
         res = cv2.imread(str(Path(result_dir) / "evidence" / f"_f{f['frame']}.jpg"))
         src = got.get(f["frame"])
@@ -428,10 +517,16 @@ def sheets(rows, source, result, W, H, out_dir, asset):
     return names
 
 
-def check_subtitles(source, result, out_dir, ocr, srt=None, keep_ranges=""):
+def auto_workers():
+    """OCR processes for the check: a quarter of the usable cores, 2-6 (the PSNR runs next to them; on 25 cores the scan
+    of 1304 took 114 s with 4 processes and 68 s with 6, and no less with more)"""
+    return max(2, min(6, cpu_share() // 4))
+
+
+def check_subtitles(source, result, out_dir, ocr, srt=None, keep_ranges="", workers=0):
     """Run all checks; write report.md, findings.csv, evidence/ and sheets into out_dir. -> summary dict.
     keep_ranges: the --keep-ranges of the film; findings there are credits ("片头片尾(保留)"), and their pictures are
-    compared with the source frame by frame."""
+    compared with the source frame by frame. workers: OCR processes (0 = automatic, 1 = in this process)."""
     t0 = time.time()
     laps = {}
 
@@ -462,14 +557,20 @@ def check_subtitles(source, result, out_dir, ocr, srt=None, keep_ranges=""):
     cal = calibrate(ocr, result, W, H, n, out_dir)
     log(f"  calibration: {cal['detail']}")
     lap("校准")
-    look = learn_subtitle_look(ocr, source, cues, W, H, fps)
-    log(f"  subtitle look from the source: {look}")
-    lap("学习字幕外观")
-    findings, stats = scan_result(ocr, result, cues, W, H, fps, n, duration, out_dir)
+    runner = Runner(ocr, workers or auto_workers(), cal["det_side"] or DET_SIDES[0])
+    log(f"  OCR in {runner.workers} process(es)")
+    try:   # the look of the source and the scan of the result run side by side in the same processes
+        learning = start_learn(runner, source, cues, W, H, fps)
+        scanning, stats = start_scan(runner, result, cues, W, H, fps, n, duration, out_dir)
+        look = finish_learn(learning)
+        log(f"  subtitle look from the source: {look}")
+        findings, stats = finish_scan(scanning, stats)
+    finally:
+        runner.close()
     log(f"  scanned {stats['ocr_frames']} frames ({stats['cue_frames']} cue frames, {stats['blind_frames']} blind): "
         f"{len(findings)} suspect boxes")
-    lap("逐句截帧和盲扫")
-    compare_with_source(findings, source, W, H, out_dir)
+    lap("字幕外观、逐句截帧和盲扫")
+    compare_with_source(findings, source, W, H, out_dir, runner.workers)
     judge(findings, W, look, keep)
     rows = merge_runs(findings, fps)
     lap("与原片比对")

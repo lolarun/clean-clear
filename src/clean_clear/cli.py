@@ -192,6 +192,8 @@ def build_argparser():
                          "report.md, findings.csv, evidence/ and contact sheets into DIR (default: next to RESULT, "
                          "subtitle_check_DATE); exit code 1 when a leftover is found, 2 when only a person can decide")
     ap.add_argument("--srt", metavar="FILE", help="with --qc-subtitles: the subtitle file of the result")
+    ap.add_argument("--qc-workers", type=int, default=0, metavar="N",
+                    help="with --qc-subtitles: OCR processes (0 = automatic, a quarter of the CPUs, 2-4; 1 = one process)")
     ap.add_argument("--logo-library", metavar="DIR",
                     help="with --probe: folder of logo masks (PNG, white = logo, one per frame size and position) "
                          "from earlier jobs; when a detected logo mask looks incomplete, a library mask that contains "
@@ -321,7 +323,7 @@ def main(argv=None):
         res = Path(args.inputs[1])
         out = Path(args.out) if args.out != "." else res.parent / time.strftime("subtitle_check_%Y%m%d")
         summary = check_subtitles(args.inputs[0], res, out, OCR(device, fixed_shape=fixed_shape(args, device)), args.srt,
-                                  args.keep_ranges)
+                                  args.keep_ranges, args.qc_workers)
         return {"合格": 0, "需返工": 1}.get(summary["conclusion"], 2)
     args.jobs_auto = args.jobs == "auto"  # an automatic count is lowered per video when the processes would not fit
     args.jobs = auto_jobs(args) if args.jobs_auto else max(1, int(args.jobs))

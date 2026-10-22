@@ -117,6 +117,35 @@ def test_a_half_erased_sentence_that_still_reads_is_a_leftover_whatever_changed(
     assert credits["verdict"] == "片头片尾(保留)"
 
 
+def test_the_frames_are_split_into_consecutive_groups_that_cover_each_frame_once():
+    runner = Q.Runner(fake_ocr, 4, 1920)      # an OCR that cannot be rebuilt in a worker: the groups still follow `workers`
+    runner.workers = 4
+    for count in (1, 5, 11, 12, 13, 2940):
+        items = list(range(100, 100 + 7 * count, 7))
+        groups = runner.chunks(items)
+        assert [x for g in groups for x in g] == items and len(groups) <= 12 and all(groups)
+
+
+def test_scanning_in_groups_finds_what_one_pass_finds(tmp_path, monkeypatch, subtitle_video):
+    cues = [(1.0, 3.0, "字幕")]
+    W, H, fps, n = Q.probe(subtitle_video)
+
+    def scan(workers, out):
+        runner = Q.Runner(fake_ocr, 1, 1920)
+        runner.workers = workers
+        jobs, stats = Q.start_scan(runner, subtitle_video, cues, W, H, fps, n, n / fps, out)
+        found, stats = Q.finish_scan(jobs, stats)
+        learned = Q.finish_learn(Q.start_learn(runner, subtitle_video, cues, W, H, fps))
+        return found, stats, learned
+
+    one, stats1, look1 = scan(1, tmp_path / "a")
+    many, stats4, look4 = scan(4, tmp_path / "b")
+    assert one and one == many and stats1 == stats4 and look1 == look4
+    assert stats1["ocr_frames"] >= 5      # the five frames of the cue, and the blind scan
+    assert sorted(p.name for p in (tmp_path / "a" / "evidence").glob("_f*")) == \
+        sorted(p.name for p in (tmp_path / "b" / "evidence").glob("_f*"))
+
+
 def test_psnr_of_two_videos_by_ffmpeg(tmp_path):
     a, b, c = tmp_path / "a.mp4", tmp_path / "b.mp4", tmp_path / "c.mp4"
     ffmpeg("-f", "lavfi", "-i", "testsrc2=size=128x96:rate=25:duration=2", "-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p", a)

@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "0.3.9"
+__version__ = "0.3.10"
 
 # Repository root (source checkout / editable install): holds models/, an optional ffmpeg/ folder and ProPainter/
 ROOT = Path(__file__).resolve().parents[2]

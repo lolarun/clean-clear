@@ -45,6 +45,7 @@ VERIFY_DET_SIDE = 960
 class OCR:
     def __init__(self, device, fixed_shape=False):
         from rapidocr import RapidOCR
+        self.spec = (device, fixed_shape)   # what a worker process needs to build the same engine
         threads = min(4, usable_cpus())  # the default (all cores) is throttled hard under a container CPU quota
         params = {"Det.limit_type": "max", "Det.limit_side_len": DET_SIDE,
                   "Global.log_level": "error",
