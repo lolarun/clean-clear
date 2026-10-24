@@ -191,7 +191,17 @@ def build_argparser():
                          "(next to RESULT unless --srt), a blind scan of one frame per second and a logo check; writes "
                          "report.md, findings.csv, evidence/ and contact sheets into DIR (default: next to RESULT, "
                          "subtitle_check_DATE); exit code 1 when a leftover is found, 2 when only a person can decide")
-    ap.add_argument("--srt", metavar="FILE", help="with --qc-subtitles: the subtitle file of the result")
+    ap.add_argument("--srt", metavar="FILE", help="with --qc-subtitles or --suggest-keep: the subtitle file")
+    ap.add_argument("--suggest-keep", action="store_true",
+                    help="suggest --keep-ranges for the opening and closing credits: clean-clear --suggest-keep VIDEO "
+                         "[--srt FILE] [-o DIR] [--llm-env FILE]. A language model (OpenAI chat-completions protocol, "
+                         "configured in .env) reads the first and last cues of the SRT, then frames of the video around "
+                         "both boundaries confirm them. Writes NAME.keep.json and the frames; nothing is erased")
+    ap.add_argument("--llm-env", metavar="FILE", help="with --suggest-keep: the .env file (default: ./.env)")
+    ap.add_argument("--keep-margin", type=float, default=5.0, metavar="SEC",
+                    help="with --suggest-keep: seconds between a suggested range and the first or last dialogue (default 5)")
+    ap.add_argument("--keep-window", type=float, default=15.0, metavar="MIN",
+                    help="with --suggest-keep: the cues of the first and of the last MIN minutes of the SRT are read (default 15)")
     ap.add_argument("--qc-workers", type=int, default=0, metavar="N",
                     help="with --qc-subtitles: OCR processes (0 = automatic, a quarter of the CPUs, 2-4; 1 = one process)")
     ap.add_argument("--logo-library", metavar="DIR",
@@ -325,6 +335,20 @@ def main(argv=None):
         summary = check_subtitles(args.inputs[0], res, out, OCR(device, fixed_shape=fixed_shape(args, device)), args.srt,
                                   args.keep_ranges, args.qc_workers)
         return {"合格": 0, "需返工": 1}.get(summary["conclusion"], 2)
+    if args.suggest_keep:
+        if len(args.inputs) != 1:
+            sys.exit("--suggest-keep needs one input: VIDEO")
+        from . import llm_ranges
+        video_path = Path(args.inputs[0])
+        srt = Path(args.srt) if args.srt else video_path.with_suffix(".srt")
+        if not srt.is_file():
+            sys.exit(f"--suggest-keep needs the SRT of the film: {srt} does not exist (make one with --srt-only, or --srt FILE)")
+        out = Path(args.out) if args.out != "." else video_path.parent
+        log(f"suggest keep ranges: {video_path.name}")
+        res = llm_ranges.suggest_keep(video_path, srt, out, llm_ranges.load_config(args.llm_env), args.keep_window * 60,
+                                      args.keep_margin)
+        llm_ranges.report(res, out)
+        return 2 if res["needs_review"] else 0
     args.jobs_auto = args.jobs == "auto"  # an automatic count is lowered per video when the processes would not fit
     args.jobs = auto_jobs(args) if args.jobs_auto else max(1, int(args.jobs))
     import cv2

@@ -29,3 +29,6 @@ output/
 
 # ProPainter checkout (see README)
 ProPainter/
+
+# Secrets (see .env.example)
+.env
