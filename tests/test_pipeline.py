@@ -17,6 +17,15 @@ def fake_ocr(strip):
     return [(np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]]), "字幕", 0.95)]
 
 
+def bar_ocr(strip):
+    """Reads only the white bar drawn over the SMPTE bars (280 x 36 px), not the white blocks of the bars themselves: a
+    "subtitle" 218 px high is no subtitle line (subtitles.drop_phantoms)"""
+    import cv2
+    count, _, stats, _ = cv2.connectedComponentsWithStats(white_pixels(strip).astype(np.uint8))
+    return [(np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]]), "字幕", 0.95)
+            for x, y, w, h, _ in stats[1:] if 250 <= w <= 310 and 30 <= h <= 42]
+
+
 class BlackFill:
     name = "fake"
 
@@ -137,7 +146,7 @@ def test_untouched_pixels_stay_as_they_were_not_converted_through_rgb(tmp_path):
     mean = {}
     for mode in ("auto", "off"):
         out = tmp_path / mode
-        pipeline.process(src, out, args("--compose", mode, "--verify", "off"), fake_ocr, BlackFill(), "libx264")
+        pipeline.process(src, out, args("--compose", mode, "--verify", "off"), bar_ocr, BlackFill(), "libx264")
         mean[mode] = finish_psnr(start_psnr(src, out / "bars_clean.mp4", tmp_path, mode, top=0.6), 25.0)["mean"]
     assert mean["auto"] > 45 and mean["auto"] > mean["off"] + 3, mean
 
@@ -161,6 +170,6 @@ def test_the_verify_windows_keep_untouched_pixels_too(tmp_path):
            "drawbox=x=500:y=650:w=280:h=36:color=white:t=fill:enable='between(n,25,60)'", "-c:v", "libx264", "-qp", "8",
            "-g", "25", "-pix_fmt", "yuv420p", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", src)
     out = tmp_path / "o"
-    pipeline.process(src, out, args("--compose", "auto"), fake_ocr, MissFirst(), "libx264")
+    pipeline.process(src, out, args("--compose", "auto"), bar_ocr, MissFirst(), "libx264")
     psnr = finish_psnr(start_psnr(src, out / "bars_clean.mp4", tmp_path, "v", top=0.6), 25.0)
     assert psnr["n"] == 75 and psnr["min"] > 40, psnr

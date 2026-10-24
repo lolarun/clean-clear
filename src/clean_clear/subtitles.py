@@ -343,6 +343,28 @@ def ts(sec):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+CREDIBLE_SEC = 0.8     # a subtitle that is read for this long is not a flicker of the detector
+MAX_LINE_H = 0.12      # text height of the subtitle line as a share of the picture height: subtitles are 2-8 %
+MIN_LINE_H = 0.015
+
+
+def drop_phantoms(line, segs, fps, H):
+    """A film without subtitles still gives the detector some boxes (clothes, patterns, a lamp read as "MA", "VG"): they
+    made up a subtitle line of 323 px (30 % of the picture) and 15 subtitles of 0.4 s, which were erased as boxes and
+    left a white smear at the bottom of the picture (Sanxiao at 1:58). Where the evidence is that thin nothing is erased.
+    -> (segs, reason); reason is "" when the segments stand."""
+    if line is None or not segs:
+        return segs, ""
+    if not MIN_LINE_H * H <= line[1] <= MAX_LINE_H * H:
+        return [], f"the subtitle line would be {line[1]:.0f} px high ({line[1] / H:.0%} of the picture)"
+    credible = [s for s in segs if (s.end - s.start + 1) / fps >= CREDIBLE_SEC]
+    if len(segs) >= 4 and len(credible) < 2:
+        return [], f"only {len(credible)} of {len(segs)} subtitles last {CREDIBLE_SEC} s or more"
+    if len(segs) >= 8 and len(credible) < 0.2 * len(segs):
+        return credible, f"{len(segs) - len(credible)} of {len(segs)} subtitles are flickers shorter than {CREDIBLE_SEC} s"
+    return segs, ""
+
+
 def write_srt(segs, fps, path, offset=0.0):
     """offset: seconds the first video frame comes after the start of the film (see video.restore_start)"""
     with open(path, "w", encoding="utf-8") as f:
