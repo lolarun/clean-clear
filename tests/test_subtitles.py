@@ -1,13 +1,4 @@
-from clean_clear.subtitles import Seg, build_segments, drop_phantoms, segments_from_ocr, ts, write_srt
-
-
-def segs_of(*seconds, fps=25):
-    """Segments of the given lengths in seconds, one second apart"""
-    out, t = [], 0
-    for d in seconds:
-        out.append(Seg(t * fps, t * fps + round(d * fps) - 1))
-        t += d + 1
-    return out
+from clean_clear.subtitles import build_segments, segments_from_ocr, ts, write_srt
 
 
 def frames(spec, n):
@@ -32,28 +23,6 @@ def test_segments_from_raw_boxes():
     per = [[]] * 10 + [box("你好")] * 20 + [[]] * 5 + [box("再见")] * 20
     line, segs = segments_from_ocr(per, 25, max_gap=2, min_dur=0.4)
     assert [(s.start, s.end, s.text) for s in segs] == [(10, 29, "你好"), (35, 54, "再见")]
-
-
-def test_a_film_without_subtitles_does_not_get_phantom_subtitles_erased():
-    # Sanxiao: 15 flickers of 0.4 s ("MA", "VG") on a line of 323 px, one credit of 1.7 s - nothing here is a subtitle
-    flickers = segs_of(*[0.4] * 14)
-    segs, why = drop_phantoms((918.0, 323.0), flickers, 25, 1080)
-    assert segs == [] and "323 px" in why                       # the line alone is not a line of subtitles
-    segs, why = drop_phantoms((918.0, 54.0), flickers + segs_of(1.7), 25, 1080)
-    assert segs == [] and "only 1 of 15" in why                 # a plausible line, but nothing that is read for long
-
-
-def test_real_subtitles_stand_even_with_a_few_short_ones():
-    dialogue = segs_of(*([1.6, 2.2, 0.5, 1.1] * 5))             # 15 of 20 last 0.8 s or more, as in a real film
-    assert drop_phantoms((990.0, 98.0), dialogue, 25, 1080) == (dialogue, "")
-    assert drop_phantoms((990.0, 98.0), segs_of(1.4), 25, 1080)[0] != []       # a quiet part with a single subtitle
-    assert drop_phantoms((990.0, 98.0), segs_of(0.4, 0.4, 1.2), 25, 1080)[1] == ""   # too few to judge
-
-
-def test_flickers_among_real_subtitles_are_dropped_but_the_real_ones_stay():
-    mixed = segs_of(*([1.5] * 3 + [0.4] * 20))
-    segs, why = drop_phantoms((990.0, 98.0), mixed, 25, 1080)
-    assert segs == mixed[:3] and "20 of 23" in why
 
 
 def test_srt_timestamp():

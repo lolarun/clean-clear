@@ -10,8 +10,8 @@ import numpy as np
 from .common import Progress, fmt_time, log
 from .cutter import parse_time
 from .masks import box_masks, frame_masks, glyph_masks, outline_score, white_pixels
-from .subtitles import (DET_SIDE, VERIFY_DET_SIDE, drop_phantoms, frame_boxes, outlined_subtitles, segments_from_ocr,
-                        subtitle_line, write_srt)
+from .subtitles import (DET_SIDE, VERIFY_DET_SIDE, frame_boxes, outlined_subtitles, segments_from_ocr, subtitle_line,
+                        write_srt)
 from . import watermark
 from .rewrite import rewrite
 from .stabilize import stabilize
@@ -238,9 +238,6 @@ def process(src, out_dir, args, ocr, backend, encoder):
                                        bridge=round(args.bridge_sec * fps))
         if line:
             log(f"  subtitle line y~{line[0]:.0f}, text height ~{line[1]:.0f}px")
-        segs, why = drop_phantoms(line, segs, fps, H)
-        if why:
-            log(f"  not taken for subtitles: {why}")
         write_srt(segs, fps, srt, offset=video_offset(src))
         log(f"  {len(segs)} subtitles -> {srt}  ({time.time() - t0:.0f}s)")
     if backend is None:
