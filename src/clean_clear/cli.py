@@ -195,8 +195,9 @@ def build_argparser():
     ap.add_argument("--suggest-keep", action="store_true",
                     help="suggest --keep-ranges for the opening and closing credits: clean-clear --suggest-keep VIDEO "
                          "[--srt FILE] [-o DIR] [--llm-env FILE]. A language model (OpenAI chat-completions protocol, "
-                         "configured in .env) reads the first and last cues of the SRT, then frames of the video around "
-                         "both boundaries confirm them. Writes NAME.keep.json and the frames; nothing is erased")
+                         "configured in .env) reads the cues of the first and of the last 15 minutes of the SRT, then frames "
+                         "of the video around both boundaries confirm them and correct a wrong SRT time. Writes "
+                         "NAME.keep.json and the frames; nothing is erased; exit code 2 when a person should look first")
     ap.add_argument("--llm-env", metavar="FILE", help="with --suggest-keep: the .env file (default: ./.env)")
     ap.add_argument("--keep-margin", type=float, default=5.0, metavar="SEC",
                     help="with --suggest-keep: seconds between a suggested range and the first or last dialogue (default 5)")
