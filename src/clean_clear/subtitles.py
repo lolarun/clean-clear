@@ -295,7 +295,89 @@ def build_segments(per_frame, max_gap, min_len, keep_edges=False, bridge=0):
             or (keep_edges and (s.start <= max_gap or s.end >= last - max_gap))]
 
 
-STYLE_MIN = 0.25  # outline score (masks.outline_score) below which a box is not a subtitle in an outlined video
+STYLE_MIN = 0.25   # outline score (masks.outline_score): half of a video's subtitle boxes score this = its subtitles are outlined
+# Below STYLE_DROP a box does not look like a subtitle in an outlined video. 1304: title, credits, a sign and print on a
+# T-shirt scored 0-0.09. The score is the dark share of the ring around the white strokes: it measures the picture behind
+# the text as much as the outline. On a dark picture text without any outline scores as high as a subtitle (0.74 against
+# 0.76, synthetic white text on the frames of Tianyan and Shuimo Qingchun), on a bright one the soft outline of a real
+# subtitle scores 0.10-0.25 against 0.03 for text without. No better local measure exists (tried: the ring against the
+# ring behind it, 0.75 and 0.6, and by 30 and 45 grey levels: not better than this one on bright pictures, more wrong on
+# dark ones), so the score alone is not a gate: see style_filter.
+STYLE_DROP = 0.10
+STYLE_KEEP = 50    # frames: a box under STYLE_DROP stays when the same text scored STYLE_DROP or more this close
+STYLE_CENTRE = 0.08   # share of the picture width: a box this close to the middle on the subtitle line is a subtitle
+STYLE_JOIN = 3.0      # text heights: a box on the row of a subtitle box this close to it belongs to the same line
+
+
+def is_language(text):
+    """Chinese characters, or an English word: not "77", "9714" or "mg" read from a number plate or a shirt"""
+    t = text.strip()
+    return any("一" <= c <= "鿿" for c in t) or sum(c.isalpha() and c.isascii() for c in t) >= 4
+
+
+def style_filter(per_frame, line=None, width=None):
+    """The boxes of a video with outlined subtitles that look like subtitles. A box scoring STYLE_DROP or more stays. One
+    below it stays when
+      - it sits on the subtitle line (position and height as subtitles.filter_line's main line), within STYLE_CENTRE of
+        the middle of the picture, and reads like language: subtitles have one template whatever the picture behind them,
+        and the scene text of the same low score (number plates, signs) is off the middle (Tianyan, Shuimo Qingchun,
+        Bagua Zhang: every dialogue segment within 2 % of the middle, plates 15-30 % off); or
+      - the same text (similar >= 0.9) scored STYLE_DROP or more within STYLE_KEEP frames (the same subtitle on a
+        brighter picture: 0.5 then 0.13 within one subtitle).
+    Text above the subtitle line (a title) is not on the line: only its score counts. line: (y, h[, y2, h2]) of the
+    subtitles; width: of the picture."""
+    if line is None:
+        line = subtitle_line(per_frame)
+    lines = [tuple(line[:2])] if line else []   # the main line only: a second line is read from the boxes before this filter
+    #                                              and a title that shows in a third of the frames looks like one
+    good = [[b[4] for b in boxes if len(b) < 6 or b[5] >= STYLE_DROP] for boxes in per_frame]
+    if width is None:   # the middle of the picture as the subtitles say it
+        cx = [(b[0] + b[2]) / 2 for boxes in per_frame for b in boxes if len(b) > 5 and b[5] >= STYLE_MIN]
+        width = 2 * float(np.median(cx)) if cx else None
+
+    def on_template(b):
+        if not lines or not width:
+            return False
+        h = b[3] - b[1]
+        return (any(0.75 * lh <= h <= 1.6 * lh and abs((b[1] + b[3]) / 2 - ly) <= 0.5 * lh for ly, lh in lines)
+                and abs((b[0] + b[2]) / 2 - width / 2) <= STYLE_CENTRE * width and is_language(b[4]))
+
+    n, seen, out = len(per_frame), {}, []
+    for i, boxes in enumerate(per_frame):
+        keep, left = [], []
+        for b in boxes:
+            if len(b) < 6 or b[5] >= STYLE_DROP or on_template(b):
+                keep.append(b)
+                continue
+            key = (b[4], i // 5)
+            if key not in seen:
+                seen[key] = any(similar(b[4], t) >= 0.9 for j in range(max(0, i - STYLE_KEEP), min(n, i + STYLE_KEEP + 1), 5)
+                                for t in good[j])
+            (keep if seen[key] else left).append(b)
+        out.append(_attach(keep, left))
+    return out
+
+
+def _attach(keep, left):
+    """The boxes of `left` that continue a line of `keep`: on its row, as high as it, no more than STYLE_JOIN heights
+    away. Two people talking put two subtitles side by side on one line ("哦带个好啊" in the middle and "哎" / "Ok!" to the
+    right of it, Shuimo Qingchun 10:22): the second is off the middle and says too little to read like language, and
+    was left on screen"""
+    keep = list(keep)
+    changed = True
+    while left and changed:
+        changed = False
+        for b in list(left):
+            h = b[3] - b[1]
+            for a in keep:
+                ha = a[3] - a[1]
+                if (0.6 <= h / max(1, ha) <= 1.7 and abs((a[1] + a[3]) / 2 - (b[1] + b[3]) / 2) <= 0.35 * max(h, ha)
+                        and max(a[0] - b[2], b[0] - a[2]) <= STYLE_JOIN * max(h, ha)):
+                    keep.append(b)
+                    left.remove(b)
+                    changed = True
+                    break
+    return keep
 
 
 def outlined_subtitles(per_frame, line):
@@ -320,14 +402,15 @@ def outlined_subtitles(per_frame, line):
     return good >= 25 and good >= 0.5 * len(scores)
 
 
-def segments_from_ocr(per_frame, fps, max_gap=5, min_dur=0.4, line="auto", keep_edges=False, outlined=None, bridge=0):
+def segments_from_ocr(per_frame, fps, max_gap=5, min_dur=0.4, line="auto", keep_edges=False, outlined=None, bridge=0,
+                      width=None):
     """Raw per-frame OCR boxes -> (subtitle line, [Seg]). `line` = a known (y centre, height) to reuse
     instead of detecting it, e.g. when checking an already cleaned video where almost no text is left.
     outlined=True (outlined_subtitles): boxes that do not look like a subtitle are dropped first. Titles, credits,
     signs and print in the picture were read as subtitles (on the subtitle line, or as the upper line of a
     two-line subtitle) and erased; a title in red even fell back to a box mask and was smeared (1304 at 1:12)."""
     if outlined:
-        per_frame = [[b for b in boxes if len(b) < 6 or b[5] >= STYLE_MIN] for boxes in per_frame]
+        per_frame = style_filter(per_frame, None if line == "auto" else line, width)
     if line == "auto":
         line = subtitle_line(per_frame)
     texts = [join_text(filter_line(list(b), line)) for b in per_frame]

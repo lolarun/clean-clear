@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 
 from .common import Progress, log
-from .subtitles import STYLE_MIN
+from .subtitles import STYLE_DROP
 from .video import read_frames
 
 
@@ -192,7 +192,7 @@ def glyph_masks(src, W, H, band, segs, dilate, grow, shift, total=0, extend=0, g
 
     Seg.gaps: frames where OCR lost the text between two reads of the same subtitle (subtitles.build_segments joined
     them). They are neither counted for the glyphs nor erased unless they show a subtitle: with outlined=True (white
-    subtitles with a dark outline) a gap frame whose box area scores below STYLE_MIN (outline_score) goes to Seg.skip
+    subtitles with a dark outline) a gap frame whose box area scores below STYLE_DROP (outline_score) goes to Seg.skip
     (1304 at 12:29: text behind a sliding sign stayed on screen, but "卖什么油桃" ... "还卖什么油桃" at 2:04 have 0.8 s
     of plain picture between them)."""
     by0, by1 = band
@@ -211,6 +211,7 @@ def glyph_masks(src, W, H, band, segs, dilate, grow, shift, total=0, extend=0, g
     # frames that vote for a segment's glyphs: its own, without the gaps (more than half of THOSE must show a stroke)
     n_vote = {k: sum(1 for i in range(s.start, s.end + 1) if i not in gap_of) for k, s in enumerate(segs)}
     gap_score = {}  # k -> {frame: outline score of the box area}
+    own_score = {}  # k -> [the same on the frames of the segment itself], for the segments that have gaps
     counts = {}
 
     # frame -> [(segment, "head"|"tail")] windows to check; neighbouring segments bound each window
@@ -274,6 +275,8 @@ def glyph_masks(src, W, H, band, segs, dilate, grow, shift, total=0, extend=0, g
         if k is not None:
             ry0, ry1, rx0, rx1 = rects[k]
             crop = strip[ry0:ry1, rx0:rx1]
+            if outlined and segs[k].gaps and (i - segs[k].start) % 3 == 0:
+                own_score.setdefault(k, []).append(outline_score(crop))
             c = counts.setdefault(k, np.zeros(boxc[k].shape, np.uint16))
             c += white_pixels(crop) & boxc[k]
             dcounts.setdefault(k, np.zeros(boxc[k].shape, np.uint16))
@@ -294,7 +297,10 @@ def glyph_masks(src, W, H, band, segs, dilate, grow, shift, total=0, extend=0, g
                 else:
                     tail[kw][2] += 1
     for k, d in gap_score.items():
-        segs[k].skip = {i for i, sc in d.items() if sc < STYLE_MIN}
+        # a gap frame without the outline is a frame without the subtitle only when the subtitle shows it elsewhere: one that
+        # scores low itself (a bright picture) cannot be told from plain picture by the score, and is erased in the gap too
+        own = float(np.median(own_score[k])) if own_score.get(k) else 0.0
+        segs[k].skip = {i for i, sc in d.items() if sc < STYLE_DROP and sc < 0.5 * own}
     if any(s.gaps for s in segs):
         n = sum(b - a + 1 for s in segs for a, b in s.gaps)
         log(f"  OCR lost the text for {n} frames inside subtitles; {sum(len(s.skip) for s in segs)} of them show no subtitle")

@@ -166,6 +166,36 @@ def test_gap_frames_without_a_subtitle_are_not_erased_and_do_not_dilute_the_glyp
     assert 4 in fs and 25 in fs and not any(i in fs for i in range(6, 24))
 
 
+def _bare_strips(n, lit):
+    """like _outlined_strips, but the strokes have no dark outline: a subtitle on a bright picture that scores 0"""
+    for i in range(n):
+        s = np.full((BAND[1] - BAND[0], W, 3), (160, 96, 48), np.uint8)
+        if i in lit:
+            for x in range(250, 386, 12):
+                s[60:80, x:x + 4] = 255
+        yield s
+
+
+def test_gap_frames_of_a_subtitle_that_scores_low_itself_are_erased_too(monkeypatch):
+    # Tianyan "姐姐" scored 0.01 (a bright picture): its gap frames score as low as plain picture, so the score cannot say
+    # that the subtitle is gone, and the gap is erased like the rest (on plain picture that does no harm)
+    monkeypatch.setattr(M, "read_frames", lambda *a, **k: _bare_strips(40, set(range(0, 5)) | set(range(25, 30))))
+    s = seg(0, 29, (245, 295, 395, 325))
+    s.gaps = [(5, 24)]
+    glyph_masks("x", W, H, BAND, [s], dilate=4, grow=3, shift=2, outlined=True)
+    assert s.skip == set()
+
+
+def test_the_gap_scores_are_taken_with_the_extension_windows_too(monkeypatch):
+    # the frames beside a segment are read for its glyphs (extend > 0) in the same loop: the own scores of a segment with
+    # gaps are taken on the frames of the segment only (a first version took them in that window loop and failed on a film)
+    monkeypatch.setattr(M, "read_frames", lambda *a, **k: _outlined_strips(60, set(range(0, 5)) | set(range(25, 40))))
+    s = seg(0, 29, (245, 295, 395, 325))
+    s.gaps = [(5, 24)]
+    glyph_masks("x", W, H, BAND, [s], dilate=4, grow=3, shift=2, extend=10, outlined=True)
+    assert s.skip == set(range(5, 25))
+
+
 def test_gap_frames_that_show_the_subtitle_are_erased(monkeypatch):
     # OCR lost the text (a bright sign behind it), the picture still shows the subtitle: erased like the rest
     monkeypatch.setattr(M, "read_frames", lambda *a, **k: _outlined_strips(40, set(range(0, 35))))

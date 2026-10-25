@@ -93,6 +93,93 @@ def test_text_in_the_picture_is_not_a_subtitle_when_the_subtitles_are_outlined()
     assert any("Red Peach" in s.text for s in before)  # without the style it is taken as an upper subtitle line
 
 
+def _same_text(scores, box=(800, 300, 1120, 330), text="我开封府定不负皇恩"):
+    """one subtitle, one frame per score: its outline score frame by frame"""
+    return [[[*box, text, s]] for s in scores]
+
+
+def test_a_subtitle_on_a_bright_picture_is_not_cut_where_its_outline_score_drops():
+    # Tianyan 1:40:05: "皇上万岁皇上万岁" scored 0.33-0.51, then 0.13 for 3.7 s where the background brightened: the SRT ended
+    # there and the last 3.7 s stayed on screen. The same subtitle is one subtitle whatever its score
+    per = _same_text([0.5] * 40 + [0.13] * 60)
+    _, segs = segments_from_ocr(per, 25, max_gap=2, min_dur=0.4, outlined=True)
+    assert [(s.start, s.end) for s in segs] == [(0, 99)]
+
+
+def test_a_subtitle_that_scores_low_all_the_way_is_still_a_subtitle_above_the_scene_text_scores():
+    # dialogue on a bright picture scored 0.11-0.23 (Tianyan "此妖女妖言惑众" 0.15 for 4.3 s) and was dropped whole by the
+    # old limit of 0.25; the scene text of 1304 (title, sign, T-shirt print) scored 0 to 0.09
+    for score, kept in ((0.15, True), (0.11, True), (0.09, False), (0.0, False)):
+        _, segs = segments_from_ocr(_same_text([score] * 60), 25, max_gap=2, min_dur=0.4, outlined=True)
+        assert bool(segs) is kept, score
+
+
+def _boxes(frames_of):
+    return [[list(b) for b in boxes] for boxes in frames_of]
+
+
+def test_a_subtitle_is_what_sits_on_the_subtitle_template_whatever_its_outline_scores():
+    # Tianyan, Shuimo Qingchun: dialogue on a bright picture scores 0.00-0.20 and was dropped; every dialogue segment sat
+    # within 2 % of the middle on the subtitle line, the scene text of the same low score (plates, signs) 15-30 % off it
+    line = (315.0, 30.0)
+    for score in (0.0, 0.05, 0.09):
+        per = _same_text([score] * 60, text="你们宋人要赔偿我们党项")
+        _, segs = segments_from_ocr(per, 25, max_gap=2, min_dur=0.4, outlined=True, width=1920)
+        assert len(segs) == 1, score                                  # centred (960 of 1920), on the line, reads like language
+        _, segs = segments_from_ocr(per, 25, max_gap=2, min_dur=0.4, line=line, outlined=True, width=1920)
+        assert len(segs) == 1, score                                  # also with the line known, as in the verify pass
+    # off the middle, as a plate or a sign is
+    plate = _same_text([0.0] * 60, box=(250, 300, 570, 330), text="你们宋人要赔偿我们党项")
+    assert segments_from_ocr(plate, 25, max_gap=2, min_dur=0.4, outlined=True, width=1920)[1] == []
+    # not on the line: half the height, or above it
+    small = _same_text([0.0] * 60, box=(800, 310, 1120, 325), text="你们宋人要赔偿我们党项")
+    assert segments_from_ocr(small, 25, max_gap=2, min_dur=0.4, line=line, outlined=True, width=1920)[1] == []
+    # no width given: the middle is what the high-scoring boxes say (here a subtitle of 20 frames that scores 0.6)
+    per = _same_text([0.6] * 20, text="第一句话在这里") + _same_text([0.0] * 60, text="你们宋人要赔偿我们党项")
+    assert [s.text for s in segments_from_ocr(per, 25, max_gap=2, min_dur=0.4, outlined=True)[1]] == ["第一句话在这里", "你们宋人要赔偿我们党项"]
+
+
+def test_text_that_does_not_read_like_language_is_not_taken_for_a_subtitle_on_the_template():
+    # a number plate or print read as "9714", "77", "mg" is centred on the line in a bad moment; a word is not
+    for text, kept in (("9714", False), ("77", False), ("mg", False), ("好", True), ("Oh, please wait", True), ("GB6072", False)):
+        per = _same_text([0.0] * 60, text=text)
+        assert bool(segments_from_ocr(per, 25, max_gap=2, min_dur=0.4, outlined=True, width=1920)[1]) is kept, text
+
+
+def test_two_people_talking_put_two_subtitles_on_one_line_and_both_are_subtitles():
+    # Shuimo Qingchun 10:22: "Oh, please pass my greetings!" in the middle and "Ok!" to the right of it, on the same row: the
+    # second is off the middle and too short to read like language, and stayed on screen after the erasing
+    from clean_clear.subtitles import style_filter
+    main, right = (362, 465, 815, 504), (852, 464, 917, 502)
+    per = [[[*main, "Oh, please pass my greetings!", 0.0], [*right, "Ok!", 0.0]] for _ in range(40)]
+    _, segs = segments_from_ocr(per, 25, max_gap=2, min_dur=0.4, outlined=True, width=1280)
+    assert len(segs) == 1 and "Ok!" in segs[0].text
+    texts = lambda extra: [b[4] for b in style_filter([[[*main, "Oh, please pass my greetings!", 0.0], extra]], width=1280)[0]]
+    assert "EXIT" not in texts([1100, 464, 1200, 502, "EXIT", 0.0])      # 285 px away: more than three text heights
+    assert "Ok!" not in texts([852, 300, 917, 338, "Ok!", 0.0])          # another row: a sign above the subtitle
+    assert "Ok!" not in texts([852, 480, 880, 495, "Ok!", 0.0])          # a third of the height: not the same print
+    assert "Ok!" in texts([852, 464, 917, 502, "Ok!", 0.0])
+    # nothing to hang on to: the same two boxes without the centred one are dropped
+    assert style_filter([[[*right, "Ok!", 0.0], [1100, 464, 1200, 502, "EXIT", 0.0]]], width=1280)[0] == []
+
+
+def test_a_title_above_the_subtitle_line_is_still_dropped_when_it_is_centred():
+    # 1304: the title "Red Peach" sits above the line, in the middle: the template rule is for the line only
+    per = _scored(90, 0.7, ((850, 268, 1070, 296), "Red Peach", 0.0))
+    _, segs = segments_from_ocr(per, 25, max_gap=2, min_dur=0.4, outlined=True, width=1920)
+    assert [s.text for s in segs] == ["第0句", "第1句", "第2句"]
+
+
+def test_a_low_score_text_is_kept_only_next_to_the_same_text_with_a_good_score():
+    from clean_clear.subtitles import style_filter
+    off = (250, 300, 570, 330)          # off the middle: the template rule does not apply, only the neighbouring frames count
+    per = _same_text([0.6] * 10 + [0.05] * 10 + [0.05] * 80 + [0.05] * 10, box=off)    # frames 0-9 score well, 10-109 do not
+    kept = [bool(f) for f in style_filter(per, width=1920)]
+    assert all(kept[:10 + 50]) and not any(kept[10 + 55:])                            # 50 frames after the last good one: gone
+    other = [[[*off, "OPEN", 0.04]] for _ in range(60)] + _same_text([0.6] * 5, box=off)
+    assert not any(style_filter(other, width=1920)[:60])                              # another text next to it: not rescued
+
+
 def test_subtitles_without_an_outline_are_not_filtered_by_style():
     # yellow subtitles, or white ones without an outline: every box scores low, nothing is dropped
     per = _scored(90, 0.0, ((850, 268, 1070, 296), "Red Peach", 0.0))

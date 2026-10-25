@@ -146,6 +146,31 @@ def test_scanning_in_groups_finds_what_one_pass_finds(tmp_path, monkeypatch, sub
         sorted(p.name for p in (tmp_path / "b" / "evidence").glob("_f*"))
 
 
+def test_a_text_that_matches_its_cue_is_a_leftover_whatever_its_outline_scores():
+    # Tianyan: whole subtitles on a bright picture stayed in the result and the check made them "to be looked at" because
+    # their outline scored 0.1-0.2: the score measures the picture behind the text, a text of the cue is a leftover
+    box = (700, 940, 1200, 1030)
+    cue = {"box": box, "style": 0.04, "diff": 0.5, "method": "cue", "t": 100.0}
+    blind = {**cue, "method": "blind"}
+    Q.judge([cue, blind], 1920, LOOK)
+    assert cue["verdict"] == "残留"
+    assert blind["verdict"] == "场景文字(自动排除)"       # tied to no cue: the score still tells scene text
+
+
+def test_a_text_of_no_cue_that_reads_like_language_is_not_called_scene_text_whatever_it_scores():
+    # Shuimo Qingchun: "What about your class?" (0.07) and "Ok!" (0.0) stayed on screen, and the check that found them called
+    # them scene text because they scored under 0.1; a number plate or a shirt reads as "9714" or "mg"
+    box = (700, 940, 1200, 1030)
+    base = {"box": box, "style": 0.0, "diff": 0.5, "method": "blind", "t": 100.0}
+    said = {**base, "text": "What about your class?"}
+    plate = {**base, "text": "9714"}
+    sign = {**base, "text": "What about your class?", "box": (100, 940, 500, 1030)}      # off the middle: a sign
+    Q.judge([said, plate, sign], 1920, LOOK)
+    assert said["verdict"] == "待人工复核"
+    assert plate["verdict"] == "场景文字(自动排除)"
+    assert sign["verdict"] == "场景文字(自动排除)"
+
+
 def test_psnr_of_two_videos_by_ffmpeg(tmp_path):
     a, b, c = tmp_path / "a.mp4", tmp_path / "b.mp4", tmp_path / "c.mp4"
     ffmpeg("-f", "lavfi", "-i", "testsrc2=size=128x96:rate=25:duration=2", "-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p", a)

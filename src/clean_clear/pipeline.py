@@ -162,7 +162,7 @@ def verify_and_fix(src, dst, W, H, fps, n, band, line, cuts, args, ocr, backend,
         side(DET_SIDE)
     _, segs = segments_from_ocr(per_frame, fps, max_gap=args.max_gap, min_dur=args.min_dur * 0.5, line=line,
                                 keep_edges=getattr(args, "split_part", False), outlined=outlined,
-                                bridge=round(args.bridge_sec * fps))
+                                bridge=round(args.bridge_sec * fps), width=W)
     if not segs:
         log("  verify: no subtitle left in the result")
         return
@@ -235,7 +235,7 @@ def process(src, out_dir, args, ocr, backend, encoder):
         # a part of a --jobs split: a subtitle cut by the split is short here but not noise, keep it at the edges
         line, segs = segments_from_ocr(per_frame, fps, max_gap=args.max_gap, min_dur=args.min_dur,
                                        keep_edges=getattr(args, "split_part", False), outlined=outlined,
-                                       bridge=round(args.bridge_sec * fps))
+                                       bridge=round(args.bridge_sec * fps), width=W)
         if line:
             log(f"  subtitle line y~{line[0]:.0f}, text height ~{line[1]:.0f}px")
         write_srt(segs, fps, srt, offset=video_offset(src))

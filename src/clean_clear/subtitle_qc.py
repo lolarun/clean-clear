@@ -29,7 +29,7 @@ import numpy as np
 from .common import __version__, cpu_share, log
 from .masks import outline_score
 from .qc import read_srt
-from .subtitles import STYLE_MIN
+from .subtitles import STYLE_DROP, STYLE_MIN, is_language
 from .video import _exe, packet_count, probe, read_frames
 
 SCORE_MIN = 0.3     # OCR confidence kept; the erasing pass uses 0.6, a leftover is judged by eye anyway
@@ -257,16 +257,22 @@ def finish_learn(jobs):
             "outlined": style >= STYLE_MIN, "samples": len(ys)}
 
 
-def looks_like_subtitle(box, W, look, style):
+def looks_like_subtitle(box, W, look, style, style_check=True, text=None):
     """The customer's "字幕外观" rules 1-3 and 5: centred (35-65 % of the width), on the subtitle line (within one text
-    height), 0.6-1.5 times the subtitle height, light with a dark outline when the video's subtitles are like that"""
+    height), 0.6-1.5 times the subtitle height. When the video's subtitles have an outline the text must also have scored
+    like one (style_check) - or read like language: the score measures the picture behind the text as much as the
+    outline, and a subtitle on a bright picture scores 0.0-0.1 (Shuimo Qingchun: "What about your class?" 0.07 and "Ok!"
+    0.0 were left on screen and called scene text), while the number plates and signs that score as low read as "9714"
+    and "mg"."""
     x0, y0, x1, y1 = box
     if not 0.35 <= (x0 + x1) / 2 / W <= 0.65:
         return False
     if "line_y" in look:
         if abs((y0 + y1) / 2 - look["line_y"]) > look["line_h"] or not 0.6 <= (y1 - y0) / look["line_h"] <= 1.5:
             return False
-    return style >= STYLE_MIN if look.get("outlined") else True
+    if not look.get("outlined") or not style_check or style >= STYLE_DROP:
+        return True
+    return text is not None and is_language(text)
 
 
 def start_scan(runner, result, cues, W, H, fps, n, duration, out_dir):
@@ -388,7 +394,9 @@ def judge(findings, W, look, keep=()):
     tied to a cue (blind scan) is a leftover only for a person to say, unless it is in a kept range (credits) or
     does not look like the subtitles and is unchanged (scene text)."""
     for f in findings:
-        like = looks_like_subtitle(f["box"], W, look, f["style"])
+        # a text that matches the cue is a leftover of that subtitle whatever its outline scores: the score measures the
+        # picture behind the text (a bright one gives a soft outline a low score); only a text tied to no cue is judged by it
+        like = looks_like_subtitle(f["box"], W, look, f["style"], style_check=f["method"] != "cue", text=f.get("text"))
         untouched = f.get("diff") is not None and f["diff"] < UNCHANGED
         f["like_subtitle"] = like
         if any(a <= f["t"] <= b for a, b in keep):
